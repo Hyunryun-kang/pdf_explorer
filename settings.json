@@ -1,0 +1,8 @@
+{
+  "viewer_mode": "",
+  "viewer_path": "",
+  "viewer_custom_args": [
+    "{viewer}",
+    "{file}"
+  ]
+}
