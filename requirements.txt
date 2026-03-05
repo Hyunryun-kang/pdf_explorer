@@ -1,0 +1,12 @@
+torch==2.6.0
+transformers==4.41.2
+sentence-transformers==2.6.1
+pymupdf
+faiss-cpu
+streamlit
+requests
+tqdm
+pillow
+accelerate
+pytesseract
+opencv-python
