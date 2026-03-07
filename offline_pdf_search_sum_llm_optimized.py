@@ -21,13 +21,13 @@ from typing import Dict, List, Set, Tuple, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
 
 try:
-    import fitz  # pymupdf
+    import fitz
 except Exception:
     fitz = None
 
-# llama-cpp-python
 try:
     from llama_cpp import Llama
 except Exception:
@@ -35,231 +35,206 @@ except Exception:
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-APP_NAME = "오프라인 PDF 내용 검색기 + 요약검색 (로컬 LLM/CPU, 최적화)"
-DB_FILENAME = "offline_pdf_index.db"
+APP_NAME      = "PDF Search + LLM 요약"
+DB_FILENAME   = "offline_pdf_index.db"
 SYNONYMS_JSON = "synonyms.json"
 SETTINGS_JSON = "settings.json"
 
-def now_iso() -> str:
+# ══════════════════════════════════════════════
+#  성경 약어 → 전체 이름  (동의어 사전 초기 데이터)
+#  term=약어, synonym=전체이름  으로 DB에 등록됩니다.
+# ══════════════════════════════════════════════
+BIBLE_BOOK_MAP: Dict[str, str] = {
+    # 구약
+    "창": "창세기",       "출": "출애굽기",     "레": "레위기",
+    "민": "민수기",       "신": "신명기",       "수": "여호수아",
+    "삿": "사사기",       "룻": "룻기",         "삼상": "사무엘상",
+    "삼하": "사무엘하",   "왕상": "열왕기상",   "왕하": "열왕기하",
+    "대상": "역대상",     "대하": "역대하",     "스": "에스라",
+    "느": "느헤미야",     "에": "에스더",       "욥": "욥기",
+    "시": "시편",         "잠": "잠언",         "전": "전도서",
+    "아": "아가",         "사": "이사야",       "렘": "예레미야",
+    "애": "예레미야애가", "겔": "에스겔",       "단": "다니엘",
+    "호": "호세아",       "욜": "요엘",         "암": "아모스",
+    "옵": "오바댜",       "욘": "요나",         "미": "미가",
+    "나": "나훔",         "합": "하박국",       "습": "스바냐",
+    "학": "학개",         "슥": "스가랴",       "말": "말라기",
+    # 신약
+    "마": "마태복음",     "막": "마가복음",     "눅": "누가복음",
+    "요": "요한복음",     "행": "사도행전",     "롬": "로마서",
+    "고전": "고린도전서", "고후": "고린도후서", "갈": "갈라디아서",
+    "엡": "에베소서",     "빌": "빌립보서",     "골": "골로새서",
+    "살전": "데살로니가전서", "살후": "데살로니가후서",
+    "딤전": "디모데전서", "딤후": "디모데후서", "딛": "디도서",
+    "몬": "빌레몬서",     "히": "히브리서",     "약": "야고보서",
+    "벧전": "베드로전서", "벧후": "베드로후서", "요일": "요한일서",
+    "요이": "요한이서",   "요삼": "요한삼서",   "유": "유다서",
+    "계": "요한계시록",
+}
+
+# ══════════════════════════════════════════════
+#  Design tokens  (Notion × Claude dark theme)
+# ══════════════════════════════════════════════
+C = {
+    "bg":           "#191919",
+    "sidebar":      "#1f1f1f",
+    "panel":        "#232323",
+    "panel2":       "#2a2a2a",
+    "input_bg":     "#272727",
+    "hover":        "#2e2e2e",
+    "active":       "#353535",
+    "border":       "#333333",
+    "border_soft":  "#2b2b2b",
+
+    "text":         "#e3e3e3",
+    "text2":        "#999999",
+    "text3":        "#555555",
+    "text_inv":     "#ffffff",
+
+    "accent":       "#d97757",
+    "accent2":      "#c96644",
+    "accent_dim":   "#2e1c12",
+    "accent_text":  "#f5c4b0",
+
+    "green":        "#4caf82",
+    "green_bg":     "#182a20",
+    "red":          "#e05c5c",
+    "red_bg":       "#2a1818",
+    "yellow":       "#d4a843",
+    "yellow_bg":    "#2a2110",
+
+    # LLM badge
+    "llm_fg":       "#9f8aff",
+    "llm_bg":       "#1e1a2e",
+}
+
+SANS = ("Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", "sans-serif")
+MONO = ("JetBrains Mono", "Fira Code", "Consolas", "Courier New", "monospace")
+
+def pfont(families, size=12, weight="normal"):
+    avail = tkfont.families()
+    for f in families:
+        if f in avail: return (f, size, weight)
+    return (families[-1], size, weight)
+
+# ══════════════════════════════════════════════
+#  Core logic  (unchanged from original)
+# ══════════════════════════════════════════════
+def now_iso():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def is_pdf(path: str) -> bool:
+def is_pdf(path):
     return path.lower().endswith(".pdf")
 
-def safe_fts_quote(term: str) -> str:
+def safe_fts_quote(term):
     return term.replace('"', '""').strip()
 
-def normalize_ws(s: str) -> str:
+def normalize_ws(s):
     return " ".join((s or "").replace("\x00", " ").split())
 
-def find_sumatra_exe() -> Optional[str]:
-    candidates = [
-        os.path.join(os.environ.get("ProgramFiles", ""), "SumatraPDF", "SumatraPDF.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "SumatraPDF", "SumatraPDF.exe"),
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    return shutil.which("SumatraPDF.exe") or shutil.which("SumatraPDF")
-
-def open_file_default(path: str) -> None:
-    try:
-        os.startfile(path)  # type: ignore[attr-defined]
-    except Exception as e:
-        raise RuntimeError(f"파일 열기 실패: {e}")
-
-def open_pdf_at_page(path: str, page_no_1base: int, settings: dict) -> None:
-    page_no_1base = max(1, int(page_no_1base))
-    mode = (settings.get("viewer_mode") or "").lower().strip()
-    vpath = (settings.get("viewer_path") or "").strip()
-
-    def run(cmd: List[str]):
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if mode and vpath and os.path.exists(vpath):
-        if mode == "sumatra":
-            run([vpath, "-reuse-instance", "-page", str(page_no_1base), path]); return
-        if mode == "acrobat":
-            run([vpath, path, "/A", f"page={page_no_1base}"]); return
-        if mode == "custom":
-            tmpl = settings.get("viewer_custom_args") or []
-            if isinstance(tmpl, list) and tmpl:
-                cmd = []
-                for tok in tmpl:
-                    if isinstance(tok, str):
-                        cmd.append(tok.replace("{viewer}", vpath).replace("{file}", path).replace("{page}", str(page_no_1base)))
-                if cmd:
-                    run(cmd); return
-
-    sumatra = find_sumatra_exe()
-    if sumatra:
-        run([sumatra, "-reuse-instance", "-page", str(page_no_1base), path]); return
-
-    open_file_default(path)
-
-def char_2grams(text: str) -> str:
-    """
-    제너레이터 방식으로 중간 리스트 생성 없이 메모리 절감.
-    """
+def char_2grams(text):
     t = normalize_ws(text)[:120_000]
-    if not t:
-        return ""
+    if not t: return ""
     t2 = t.replace(" ", "")
-    if len(t2) < 2:
-        return t2
+    if len(t2) < 2: return t2
     gram_count = len(t2) - 1
     step = max(1, gram_count // 250_000) if gram_count > 250_000 else 1
     return " ".join(t2[i:i+2] for i in range(0, gram_count, step))
 
-# -----------------------------
-# LLM summarizer (llama.cpp)
-# -----------------------------
-def llm_summarize(
-    llm: "Llama",
-    text: str,
-    max_chars_in: int = 60_000,
-    max_tokens_out: int = 220,
-) -> str:
-    """
-    문서 일부를 넣고 한국어 요약 생성.
-    - CPU 환경: 입력을 너무 길게 넣으면 폭발합니다(시간/메모리). 제한 필수.
-    """
-    t = normalize_ws(text)
-    if not t:
-        return ""
-    if len(t) > max_chars_in:
-        t = t[:max_chars_in]
+def find_sumatra_exe():
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles",""),    "SumatraPDF", "SumatraPDF.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)",""), "SumatraPDF", "SumatraPDF.exe"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c): return c
+    return shutil.which("SumatraPDF.exe") or shutil.which("SumatraPDF")
 
+def open_file_default(path):
+    try: os.startfile(path)
+    except Exception as e: raise RuntimeError(f"파일 열기 실패: {e}")
+
+def open_pdf_at_page(path, page_no_1base, settings):
+    page_no_1base = max(1, int(page_no_1base))
+    mode  = (settings.get("viewer_mode") or "").lower().strip()
+    vpath = (settings.get("viewer_path") or "").strip()
+    def run(cmd): subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if mode and vpath and os.path.exists(vpath):
+        if mode == "sumatra": run([vpath,"-reuse-instance","-page",str(page_no_1base),path]); return
+        if mode == "acrobat": run([vpath,path,"/A",f"page={page_no_1base}"]); return
+        if mode == "custom":
+            tmpl = settings.get("viewer_custom_args") or []
+            if isinstance(tmpl,list) and tmpl:
+                cmd = [t.replace("{viewer}",vpath).replace("{file}",path).replace("{page}",str(page_no_1base))
+                       for t in tmpl if isinstance(t,str)]
+                if cmd: run(cmd); return
+    sumatra = find_sumatra_exe()
+    if sumatra: run([sumatra,"-reuse-instance","-page",str(page_no_1base),path]); return
+    open_file_default(path)
+
+def llm_summarize(llm, text, max_chars_in=60_000, max_tokens_out=220):
+    t = normalize_ws(text)
+    if not t: return ""
+    if len(t) > max_chars_in: t = t[:max_chars_in]
     prompt = (
         "다음 문서를 한국어로 간결하게 요약해라.\n"
-        "- 핵심 주제 1~2문장\n"
-        "- 주요 포인트 3~6개를 문장으로\n"
+        "- 핵심 주제 1~2문장\n- 주요 포인트 3~6개를 문장으로\n"
         "- 과장/추측 금지, 문서에 있는 내용만\n\n"
         f"문서:\n{t}\n\n요약:\n"
     )
-
-    # llama-cpp-python API: create_completion 또는 __call__
-    # 모델에 따라 stop 토큰이 다르니 안전하게 줄바꿈 기반.
-    out = llm(
-        prompt,
-        max_tokens=max_tokens_out,
-        temperature=0.2,
-        top_p=0.9,
-        repeat_penalty=1.1,
-        stop=["\n\n\n"],
-    )
-    txt = ""
-    try:
-        txt = out["choices"][0]["text"]
-    except Exception:
-        txt = str(out)
+    out = llm(prompt, max_tokens=max_tokens_out, temperature=0.2,
+              top_p=0.9, repeat_penalty=1.1, stop=["\n\n\n"])
+    try:    txt = out["choices"][0]["text"]
+    except: txt = str(out)
     return normalize_ws(txt)
 
-# -----------------------------
-# DB (요약 저장 + 요약 FTS)
-# -----------------------------
+# ── DB ────────────────────────────────────────
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS documents (
     doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,
-    file_mtime INTEGER NOT NULL,
-    file_size INTEGER NOT NULL,
-    last_indexed_at TEXT,
-    status TEXT NOT NULL DEFAULT 'ok'
-);
-
+    file_mtime INTEGER NOT NULL, file_size INTEGER NOT NULL,
+    last_indexed_at TEXT, status TEXT NOT NULL DEFAULT 'ok');
 CREATE TABLE IF NOT EXISTS pages (
     page_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    doc_id INTEGER NOT NULL,
-    page_no INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
-);
-
+    doc_id INTEGER NOT NULL, page_no INTEGER NOT NULL, text TEXT NOT NULL,
+    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE);
 CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts
-USING fts5(
-    text,
-    content='pages',
-    content_rowid='page_id',
-    tokenize='unicode61'
-);
-
+    USING fts5(text, content='pages', content_rowid='page_id', tokenize='unicode61');
 CREATE TRIGGER IF NOT EXISTS pages_ai AFTER INSERT ON pages BEGIN
-    INSERT INTO pages_fts(rowid, text) VALUES (new.page_id, new.text);
-END;
-
+    INSERT INTO pages_fts(rowid,text) VALUES (new.page_id,new.text); END;
 CREATE TRIGGER IF NOT EXISTS pages_ad AFTER DELETE ON pages BEGIN
-    INSERT INTO pages_fts(pages_fts, rowid, text) VALUES ('delete', old.page_id, old.text);
-END;
-
+    INSERT INTO pages_fts(pages_fts,rowid,text) VALUES ('delete',old.page_id,old.text); END;
 CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pages BEGIN
-    INSERT INTO pages_fts(pages_fts, rowid, text) VALUES ('delete', old.page_id, old.text);
-    INSERT INTO pages_fts(rowid, text) VALUES (new.page_id, new.text);
-END;
-
+    INSERT INTO pages_fts(pages_fts,rowid,text) VALUES ('delete',old.page_id,old.text);
+    INSERT INTO pages_fts(rowid,text) VALUES (new.page_id,new.text); END;
 CREATE TABLE IF NOT EXISTS pages_ng (
-    page_id INTEGER PRIMARY KEY,
-    grams TEXT NOT NULL,
-    FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
-);
-
+    page_id INTEGER PRIMARY KEY, grams TEXT NOT NULL,
+    FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE);
 CREATE VIRTUAL TABLE IF NOT EXISTS pages_ng_fts
-USING fts5(
-    grams,
-    content='pages_ng',
-    content_rowid='page_id',
-    tokenize='unicode61'
-);
-
+    USING fts5(grams, content='pages_ng', content_rowid='page_id', tokenize='unicode61');
 CREATE TRIGGER IF NOT EXISTS pagesng_ai AFTER INSERT ON pages_ng BEGIN
-    INSERT INTO pages_ng_fts(rowid, grams) VALUES (new.page_id, new.grams);
-END;
-
+    INSERT INTO pages_ng_fts(rowid,grams) VALUES (new.page_id,new.grams); END;
 CREATE TRIGGER IF NOT EXISTS pagesng_ad AFTER DELETE ON pages_ng BEGIN
-    INSERT INTO pages_ng_fts(pages_ng_fts, rowid, grams) VALUES ('delete', old.page_id, old.grams);
-END;
-
+    INSERT INTO pages_ng_fts(pages_ng_fts,rowid,grams) VALUES ('delete',old.page_id,old.grams); END;
 CREATE TRIGGER IF NOT EXISTS pagesng_au AFTER UPDATE ON pages_ng BEGIN
-    INSERT INTO pages_ng_fts(pages_ng_fts, rowid, grams) VALUES ('delete', old.page_id, old.grams);
-    INSERT INTO pages_ng_fts(rowid, grams) VALUES (new.page_id, new.grams);
-END;
-
+    INSERT INTO pages_ng_fts(pages_ng_fts,rowid,grams) VALUES ('delete',old.page_id,old.grams);
+    INSERT INTO pages_ng_fts(rowid,grams) VALUES (new.page_id,new.grams); END;
 CREATE TABLE IF NOT EXISTS doc_summaries (
-    doc_id INTEGER PRIMARY KEY,
-    summary TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
-);
-
+    doc_id INTEGER PRIMARY KEY, summary TEXT NOT NULL, updated_at TEXT NOT NULL,
+    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE);
 CREATE VIRTUAL TABLE IF NOT EXISTS doc_summaries_fts
-USING fts5(
-    summary,
-    content='doc_summaries',
-    content_rowid='doc_id',
-    tokenize='unicode61'
-);
-
+    USING fts5(summary, content='doc_summaries', content_rowid='doc_id', tokenize='unicode61');
 CREATE TRIGGER IF NOT EXISTS docsumm_ai AFTER INSERT ON doc_summaries BEGIN
-    INSERT INTO doc_summaries_fts(rowid, summary) VALUES (new.doc_id, new.summary);
-END;
-
+    INSERT INTO doc_summaries_fts(rowid,summary) VALUES (new.doc_id,new.summary); END;
 CREATE TRIGGER IF NOT EXISTS docsumm_ad AFTER DELETE ON doc_summaries BEGIN
-    INSERT INTO doc_summaries_fts(doc_summaries_fts, rowid, summary) VALUES ('delete', old.doc_id, old.summary);
-END;
-
+    INSERT INTO doc_summaries_fts(doc_summaries_fts,rowid,summary) VALUES ('delete',old.doc_id,old.summary); END;
 CREATE TRIGGER IF NOT EXISTS docsumm_au AFTER UPDATE ON doc_summaries BEGIN
-    INSERT INTO doc_summaries_fts(doc_summaries_fts, rowid, summary) VALUES ('delete', old.doc_id, old.summary);
-    INSERT INTO doc_summaries_fts(rowid, summary) VALUES (new.doc_id, new.summary);
-END;
-
+    INSERT INTO doc_summaries_fts(doc_summaries_fts,rowid,summary) VALUES ('delete',old.doc_id,old.summary);
+    INSERT INTO doc_summaries_fts(rowid,summary) VALUES (new.doc_id,new.summary); END;
 CREATE TABLE IF NOT EXISTS synonyms (
-    term TEXT NOT NULL,
-    synonym TEXT NOT NULL,
-    PRIMARY KEY (term, synonym)
-);
-
+    term TEXT NOT NULL, synonym TEXT NOT NULL, PRIMARY KEY (term, synonym));
 CREATE INDEX IF NOT EXISTS idx_pages_doc_page ON pages(doc_id, page_no);
 CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
 CREATE INDEX IF NOT EXISTS idx_pages_doc ON pages(doc_id);
@@ -267,16 +242,14 @@ CREATE INDEX IF NOT EXISTS idx_doc_summaries_doc ON doc_summaries(doc_id);
 """
 
 class IndexDB:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path):
         self.db_path = db_path
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON;")
-        self._conn.execute("PRAGMA journal_mode = WAL;")
-        self._conn.execute("PRAGMA synchronous = NORMAL;")
-        self._conn.execute("PRAGMA temp_store = MEMORY;")
-        self._conn.execute("PRAGMA cache_size = -200000;")
-        self._conn.execute("PRAGMA mmap_size = 67108864;")  # 64MB 메모리 맵 I/O
+        for p in ["PRAGMA foreign_keys=ON;","PRAGMA journal_mode=WAL;",
+                  "PRAGMA synchronous=NORMAL;","PRAGMA temp_store=MEMORY;",
+                  "PRAGMA cache_size=-200000;","PRAGMA mmap_size=67108864;"]:
+            self._conn.execute(p)
         self._conn.executescript(SCHEMA_SQL)
         self._conn.commit()
         self._conn.execute("SELECT 1 FROM pages_fts LIMIT 1;")
@@ -284,975 +257,1088 @@ class IndexDB:
 
     def close(self):
         try: self._conn.close()
-        except Exception: pass
+        except: pass
 
-    def upsert_document(self, path: str, mtime: int, size: int, status: str = "ok") -> int:
+    def upsert_document(self, path, mtime, size, status="ok"):
         cur = self._conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO documents(path, file_mtime, file_size, last_indexed_at, status)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                file_mtime=excluded.file_mtime,
-                file_size=excluded.file_size,
-                last_indexed_at=excluded.last_indexed_at,
-                status=excluded.status
-            """,
-            (path, mtime, size, now_iso(), status),
-        )
+        cur.execute("""INSERT INTO documents(path,file_mtime,file_size,last_indexed_at,status)
+            VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+            file_mtime=excluded.file_mtime,file_size=excluded.file_size,
+            last_indexed_at=excluded.last_indexed_at,status=excluded.status""",
+            (path,mtime,size,now_iso(),status))
         self._conn.commit()
-        cur.execute("SELECT doc_id FROM documents WHERE path = ?", (path,))
-        row = cur.fetchone()
-        if not row:
-            raise RuntimeError("doc_id 조회 실패")
-        return int(row["doc_id"])
+        cur.execute("SELECT doc_id FROM documents WHERE path=?",(path,))
+        return int(cur.fetchone()["doc_id"])
 
-    def get_document_meta(self, path: str) -> Optional[Tuple[int, int, int]]:
+    def get_document_meta(self, path):
         cur = self._conn.cursor()
-        cur.execute("SELECT doc_id, file_mtime, file_size FROM documents WHERE path = ?", (path,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return int(row["doc_id"]), int(row["file_mtime"]), int(row["file_size"])
+        cur.execute("SELECT doc_id,file_mtime,file_size FROM documents WHERE path=?",(path,))
+        r = cur.fetchone()
+        return (int(r["doc_id"]),int(r["file_mtime"]),int(r["file_size"])) if r else None
 
-    def list_document_paths(self) -> Set[str]:
+    def list_document_paths(self):
         cur = self._conn.cursor()
         cur.execute("SELECT path FROM documents")
         return {r["path"] for r in cur.fetchall()}
 
-    def delete_document_by_path(self, path: str) -> None:
-        self._conn.execute("DELETE FROM documents WHERE path = ?", (path,))
+    def delete_document_by_path(self, path):
+        self._conn.execute("DELETE FROM documents WHERE path=?",(path,))
         self._conn.commit()
 
-    def replace_pages(self, doc_id: int, pages_text: List[Tuple[int, str]], build_ngram: bool):
+    def replace_pages(self, doc_id, pages_text, build_ngram):
         cur = self._conn.cursor()
-        cur.execute("DELETE FROM pages WHERE doc_id = ?", (doc_id,))
-        cur.executemany(
-            "INSERT INTO pages(doc_id, page_no, text) VALUES (?, ?, ?)",
-            [(doc_id, pno, txt) for (pno, txt) in pages_text],
-        )
+        cur.execute("DELETE FROM pages WHERE doc_id=?",(doc_id,))
+        cur.executemany("INSERT INTO pages(doc_id,page_no,text) VALUES(?,?,?)",
+                        [(doc_id,pno,txt) for pno,txt in pages_text])
         if build_ngram:
-            # page_id만 재조회(텍스트는 이미 pages_text에 있으므로 재전송 불필요)
-            pno_to_text = {pno: txt for pno, txt in pages_text}
-            cur.execute("SELECT page_id, page_no FROM pages WHERE doc_id = ? ORDER BY page_no", (doc_id,))
-            grams_rows = [
-                (int(r["page_id"]), char_2grams(pno_to_text.get(r["page_no"], "")))
-                for r in cur.fetchall()
-            ]
-            cur.executemany("INSERT OR REPLACE INTO pages_ng(page_id, grams) VALUES (?, ?)", grams_rows)
+            pno_to_text = {pno:txt for pno,txt in pages_text}
+            cur.execute("SELECT page_id,page_no FROM pages WHERE doc_id=? ORDER BY page_no",(doc_id,))
+            cur.executemany("INSERT OR REPLACE INTO pages_ng(page_id,grams) VALUES(?,?)",
+                [(int(r["page_id"]),char_2grams(pno_to_text.get(r["page_no"],""))) for r in cur.fetchall()])
         else:
-            cur.execute(
-                "DELETE FROM pages_ng WHERE page_id IN (SELECT page_id FROM pages WHERE doc_id = ?)",
-                (doc_id,),
-            )
+            cur.execute("DELETE FROM pages_ng WHERE page_id IN "
+                        "(SELECT page_id FROM pages WHERE doc_id=?)",(doc_id,))
         self._conn.commit()
 
-    def upsert_doc_summary(self, doc_id: int, summary: str):
+    def upsert_doc_summary(self, doc_id, summary):
         summary = normalize_ws(summary)
-        cur = self._conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO doc_summaries(doc_id, summary, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(doc_id) DO UPDATE SET
-                summary=excluded.summary,
-                updated_at=excluded.updated_at
-            """,
-            (doc_id, summary, now_iso()),
-        )
+        self._conn.execute("""INSERT INTO doc_summaries(doc_id,summary,updated_at)
+            VALUES(?,?,?) ON CONFLICT(doc_id) DO UPDATE SET
+            summary=excluded.summary,updated_at=excluded.updated_at""",
+            (doc_id,summary,now_iso()))
         self._conn.commit()
 
-    def load_synonyms_map(self) -> Dict[str, Set[str]]:
+    def load_synonyms_map(self):
         cur = self._conn.cursor()
-        cur.execute("SELECT term, synonym FROM synonyms")
-        mp: Dict[str, Set[str]] = {}
-        for r in cur.fetchall():
-            mp.setdefault(r["term"], set()).add(r["synonym"])
+        cur.execute("SELECT term,synonym FROM synonyms")
+        mp = {}
+        for r in cur.fetchall(): mp.setdefault(r["term"],set()).add(r["synonym"])
         return mp
 
-    def import_synonyms_from_json(self, json_path: str) -> None:
-        if not os.path.exists(json_path):
-            template = {"예시": ["샘플", "견본"], "PDF": ["피디에프"]}
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(template, f, ensure_ascii=False, indent=2)
-            return
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("synonyms.json은 {term:[...]} 형태여야 합니다.")
-        rows = []
-        for term, syns in data.items():
-            if isinstance(term, str) and isinstance(syns, list):
-                for s in syns:
-                    if isinstance(s, str) and s.strip():
-                        rows.append((term.strip(), s.strip()))
-        self._conn.executemany("INSERT OR IGNORE INTO synonyms(term, synonym) VALUES (?, ?)", rows)
+    def add_synonym(self, term, synonym):
+        term,synonym = term.strip(),synonym.strip()
+        if term and synonym:
+            self._conn.execute("INSERT OR IGNORE INTO synonyms(term,synonym) VALUES(?,?)",(term,synonym))
+            self._conn.commit()
+
+    def delete_synonym(self, term, synonym):
+        self._conn.execute("DELETE FROM synonyms WHERE term=? AND synonym=?",(term,synonym))
         self._conn.commit()
 
-    def add_synonym(self, term: str, synonym: str) -> None:
-        term, synonym = term.strip(), synonym.strip()
-        if not term or not synonym:
-            return
-        self._conn.execute("INSERT OR IGNORE INTO synonyms(term, synonym) VALUES (?, ?)", (term, synonym))
+    def delete_term(self, term):
+        self._conn.execute("DELETE FROM synonyms WHERE term=?",(term,))
         self._conn.commit()
 
-    def delete_synonym(self, term: str, synonym: str) -> None:
-        self._conn.execute("DELETE FROM synonyms WHERE term = ? AND synonym = ?", (term, synonym))
-        self._conn.commit()
-
-    def delete_term(self, term: str) -> None:
-        self._conn.execute("DELETE FROM synonyms WHERE term = ?", (term,))
-        self._conn.commit()
-
-    def export_synonyms_to_json(self, json_path: str) -> None:
+    def export_synonyms_to_json(self, json_path):
         mp = self.load_synonyms_map()
-        data = {k: sorted(list(vs)) for k, vs in sorted(mp.items(), key=lambda x: x[0].lower())}
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        data = {k:sorted(list(vs)) for k,vs in sorted(mp.items(),key=lambda x:x[0].lower())}
+        with open(json_path,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
 
-    def search_pages_text(self, fts_query: str, limit: int = 250) -> List[sqlite3.Row]:
+    def import_synonyms_from_json(self, json_path):
+        if not os.path.exists(json_path):
+            with open(json_path,"w",encoding="utf-8") as f:
+                json.dump({"예시":["샘플","견본"],"PDF":["피디에프"]},f,ensure_ascii=False,indent=2)
+            return
+        with open(json_path,"r",encoding="utf-8") as f: data = json.load(f)
+        if not isinstance(data,dict): raise ValueError("synonyms.json은 {term:[...]} 형태여야 합니다.")
+        rows = [(t.strip(),s.strip()) for t,ss in data.items()
+                if isinstance(t,str) and isinstance(ss,list)
+                for s in ss if isinstance(s,str) and s.strip()]
+        self._conn.executemany("INSERT OR IGNORE INTO synonyms(term,synonym) VALUES(?,?)",rows)
+        self._conn.commit()
+
+    def seed_bible_synonyms(self) -> int:
+        """BIBLE_BOOK_MAP의 약어↔전체이름을 양방향으로 synonyms 테이블에 등록.
+        이미 존재하는 항목은 INSERT OR IGNORE로 건너뜁니다.
+        반환값: 새로 삽입된 행 수."""
+        rows = []
+        for abbr, full in BIBLE_BOOK_MAP.items():
+            rows.append((abbr, full))   # 약어 → 전체이름
+            rows.append((full, abbr))   # 전체이름 → 약어 (역방향 확장)
         cur = self._conn.cursor()
-        cur.execute(
-            """
-            SELECT d.path AS path, p.page_no AS page_no,
-                   snippet(pages_fts, 0, '[', ']', ' … ', 12) AS snippet,
-                   bm25(pages_fts) AS score
-            FROM pages_fts
-            JOIN pages p ON p.page_id = pages_fts.rowid
-            JOIN documents d ON d.doc_id = p.doc_id
-            WHERE pages_fts MATCH ?
-            ORDER BY score
-            LIMIT ?
-            """,
-            (fts_query, limit),
-        )
+        cur.executemany("INSERT OR IGNORE INTO synonyms(term,synonym) VALUES(?,?)", rows)
+        inserted = cur.rowcount
+        self._conn.commit()
+        return inserted
+
+    def search_pages_text(self, fts_query, limit=250):
+        cur = self._conn.cursor()
+        cur.execute("""SELECT d.path,p.page_no,
+            snippet(pages_fts,0,'[',']',' … ',12) AS snippet, bm25(pages_fts) AS score
+            FROM pages_fts JOIN pages p ON p.page_id=pages_fts.rowid
+            JOIN documents d ON d.doc_id=p.doc_id
+            WHERE pages_fts MATCH ? ORDER BY score LIMIT ?""",(fts_query,limit))
         return cur.fetchall()
 
-    def search_pages_ngram(self, grams_query: str, limit: int = 250) -> List[sqlite3.Row]:
+    def search_pages_ngram(self, grams_query, limit=250):
         cur = self._conn.cursor()
-        cur.execute(
-            """
-            SELECT d.path AS path, p.page_no AS page_no,
-                   snippet(pages_ng_fts, 0, '[', ']', ' … ', 12) AS snippet,
-                   bm25(pages_ng_fts) AS score
-            FROM pages_ng_fts
-            JOIN pages p ON p.page_id = pages_ng_fts.rowid
-            JOIN documents d ON d.doc_id = p.doc_id
-            WHERE pages_ng_fts MATCH ?
-            ORDER BY score
-            LIMIT ?
-            """,
-            (grams_query, limit),
-        )
+        cur.execute("""SELECT d.path,p.page_no,
+            snippet(pages_ng_fts,0,'[',']',' … ',12) AS snippet, bm25(pages_ng_fts) AS score
+            FROM pages_ng_fts JOIN pages p ON p.page_id=pages_ng_fts.rowid
+            JOIN documents d ON d.doc_id=p.doc_id
+            WHERE pages_ng_fts MATCH ? ORDER BY score LIMIT ?""",(grams_query,limit))
         return cur.fetchall()
 
-    def search_doc_summaries(self, fts_query: str, limit: int = 200) -> List[sqlite3.Row]:
+    def search_doc_summaries(self, fts_query, limit=200):
         cur = self._conn.cursor()
-        cur.execute(
-            """
-            SELECT d.path AS path,
-                   1 AS page_no,
-                   snippet(doc_summaries_fts, 0, '[', ']', ' … ', 18) AS snippet,
-                   bm25(doc_summaries_fts) AS score
-            FROM doc_summaries_fts
-            JOIN documents d ON d.doc_id = doc_summaries_fts.rowid
-            WHERE doc_summaries_fts MATCH ?
-            ORDER BY score
-            LIMIT ?
-            """,
-            (fts_query, limit),
-        )
+        cur.execute("""SELECT d.path, 1 AS page_no,
+            snippet(doc_summaries_fts,0,'[',']',' … ',18) AS snippet,
+            bm25(doc_summaries_fts) AS score
+            FROM doc_summaries_fts JOIN documents d ON d.doc_id=doc_summaries_fts.rowid
+            WHERE doc_summaries_fts MATCH ? ORDER BY score LIMIT ?""",(fts_query,limit))
         return cur.fetchall()
 
-# query helpers
-def build_graph(mp: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
-    g: Dict[str, Set[str]] = {}
-    for k, vs in mp.items():
-        g.setdefault(k, set()).update(vs)
+# ── Query helpers ─────────────────────────────
+def build_graph(mp):
+    g = {}
+    for k,vs in mp.items(): g.setdefault(k,set()).update(vs)
     return g
 
-def expand_terms(base_terms: List[str], graph: Dict[str, Set[str]], max_depth: int = 2) -> Set[str]:
-    out: Set[str] = {t for t in base_terms if t.strip()}
-    visited: Set[str] = set(out)
-    # deque 사용으로 popleft() O(1) (list.pop(0)는 O(n))
-    q: deque = deque((t, 0) for t in out)
+def expand_terms(base_terms, graph, max_depth=2):
+    out = {t for t in base_terms if t.strip()}
+    visited = set(out)
+    q = deque((t,0) for t in out)
     while q:
-        term, depth = q.popleft()
-        if depth >= max_depth:
-            continue
-        for nxt in graph.get(term, set()):
+        term,depth = q.popleft()
+        if depth >= max_depth: continue
+        for nxt in graph.get(term,set()):
             nxt = nxt.strip()
-            if not nxt or nxt in visited:
-                continue
-            visited.add(nxt)
-            out.add(nxt)
-            q.append((nxt, depth + 1))
+            if not nxt or nxt in visited: continue
+            visited.add(nxt); out.add(nxt); q.append((nxt,depth+1))
     return out
 
-def parse_query(user_query: str) -> Tuple[List[str], List[str]]:
+def parse_query(user_query):
     q = user_query.strip()
-    if not q:
-        return [], []
-    phrases: List[str] = []
-    tokens: List[str] = []
+    if not q: return [],[]
+    phrases,tokens = [],[]
     i = 0
     while i < len(q):
         if q[i] == '"':
-            j = i + 1
-            while j < len(q) and q[j] != '"':
-                j += 1
-            if j < len(q) and q[j] == '"':
-                ph = q[i + 1 : j].strip()
-                if ph:
-                    phrases.append(ph)
-                i = j + 1
+            j = i+1
+            while j < len(q) and q[j] != '"': j += 1
+            if j < len(q):
+                ph = q[i+1:j].strip()
+                if ph: phrases.append(ph)
+                i = j+1
             else:
-                rest = q[i + 1 :].strip()
-                if rest:
-                    tokens.extend(rest.split())
+                rest = q[i+1:].strip()
+                if rest: tokens.extend(rest.split())
                 break
         else:
             j = i
-            while j < len(q) and q[j] != '"':
-                j += 1
+            while j < len(q) and q[j] != '"': j += 1
             chunk = q[i:j].strip()
-            if chunk:
-                tokens.extend(chunk.split())
+            if chunk: tokens.extend(chunk.split())
             i = j
-    return tokens, phrases
+    return tokens,phrases
 
-def make_fts_query(user_query: str, expanded: bool, syn_graph: Dict[str, Set[str]]) -> str:
-    tokens, phrases = parse_query(user_query)
-    parts: List[str] = []
-    for ph in phrases:
-        parts.append(f'"{safe_fts_quote(ph)}"')
-    final_terms: Set[str] = set(tokens)
-    if expanded and tokens:
-        final_terms = expand_terms(tokens, syn_graph, max_depth=2)
-    for t in sorted(final_terms):
-        tq = safe_fts_quote(t)
-        if tq:
-            parts.append(f'"{tq}"')
+def make_fts_query(user_query, expanded, syn_graph):
+    tokens,phrases = parse_query(user_query)
+    parts = [f'"{safe_fts_quote(ph)}"' for ph in phrases]
+    final_terms = expand_terms(tokens,syn_graph) if expanded and tokens else set(tokens)
+    parts += [f'"{safe_fts_quote(t)}"' for t in sorted(final_terms) if safe_fts_quote(t)]
     return " OR ".join(parts)
 
-def make_ngram_query(user_query: str, expanded: bool, syn_graph: Dict[str, Set[str]]) -> str:
-    tokens, phrases = parse_query(user_query)
-    all_terms: List[str] = tokens + phrases
-    if expanded and tokens:
-        exp = expand_terms(tokens, syn_graph, max_depth=2)
-        all_terms = list(exp) + phrases
-    token_clauses = []
+def make_ngram_query(user_query, expanded, syn_graph):
+    tokens,phrases = parse_query(user_query)
+    all_terms = tokens+phrases
+    if expanded and tokens: all_terms = list(expand_terms(tokens,syn_graph))+phrases
+    clauses = []
     for term in all_terms:
         term = term.strip()
-        if not term:
-            continue
+        if not term: continue
         grams = char_2grams(term)
-        if not grams:
-            continue
+        if not grams: continue
         g_tokens = grams.split()
         ands = " AND ".join([f'"{safe_fts_quote(gt)}"' for gt in g_tokens[:80]])
-        if ands:
-            token_clauses.append(f"({ands})")
-    return " OR ".join(token_clauses)
+        if ands: clauses.append(f"({ands})")
+    return " OR ".join(clauses)
 
+# ── Indexer ───────────────────────────────────
 @dataclass
 class IndexProgress:
-    current: int
-    total: int
-    path: str
+    current: int; total: int; path: str
 
 @dataclass
 class IndexErrorItem:
-    path: str
-    error: str
+    path: str; error: str
 
-def extract_pdf_text_pages(path: str) -> List[Tuple[int, str]]:
-    if fitz is None:
-        raise RuntimeError("PyMuPDF 미설치")
-    pages_text: List[Tuple[int, str]] = []
+def extract_pdf_text_pages(path):
+    if fitz is None: raise RuntimeError("PyMuPDF 미설치")
+    pages_text = []
     with fitz.open(path) as doc:
         for pno in range(doc.page_count):
-            page = doc.load_page(pno)
-            text = page.get_text("text") or ""
-            pages_text.append((pno + 1, normalize_ws(text)))
+            text = doc.load_page(pno).get_text("text") or ""
+            pages_text.append((pno+1, normalize_ws(text)))
     return pages_text
 
-def build_doc_text_for_summary(pages_text: List[Tuple[int, str]], max_pages: int = 20) -> str:
-    if not pages_text:
-        return ""
-    parts = []
-    for (pno, txt) in pages_text[:max_pages]:
-        if txt:
-            parts.append(txt)
-    return "\n".join(parts)
+def build_doc_text_for_summary(pages_text, max_pages=20):
+    return "\n".join(txt for _,txt in pages_text[:max_pages] if txt)
 
 class IndexerThread(threading.Thread):
-    def __init__(
-        self,
-        db_path: str,
-        root_folder: str,
-        event_queue: queue.Queue,
-        cancel_event: threading.Event,
-        build_ngram: bool,
-        parallel: bool,
-        max_workers: int,
-        build_summary: bool,
-        llm_model_path: str,
-        llm_ctx: int,
-        llm_threads: int,
-    ):
+    def __init__(self, db_path, root_folder, event_queue, cancel_event,
+                 build_ngram, parallel, max_workers,
+                 build_summary, llm_model_path, llm_ctx, llm_threads):
         super().__init__(daemon=True)
-        self.db_path = db_path
-        self.root_folder = root_folder
-        self.q = event_queue
-        self.cancel = cancel_event
-        self.build_ngram = build_ngram
-        self.parallel = parallel
-        self.max_workers = max_workers
-        self.build_summary = build_summary
-        self.llm_model_path = llm_model_path
-        self.llm_ctx = llm_ctx
-        self.llm_threads = llm_threads
-        self._llm = None
+        self.db_path=db_path; self.root_folder=root_folder
+        self.q=event_queue; self.cancel=cancel_event
+        self.build_ngram=build_ngram; self.parallel=parallel; self.max_workers=max_workers
+        self.build_summary=build_summary; self.llm_model_path=llm_model_path
+        self.llm_ctx=llm_ctx; self.llm_threads=llm_threads; self._llm=None
 
     def _get_llm(self):
-        if not self.build_summary:
-            return None
-        if Llama is None:
-            raise RuntimeError("llama-cpp-python이 설치되어 있지 않습니다. pip install llama-cpp-python")
+        if not self.build_summary: return None
+        if Llama is None: raise RuntimeError("llama-cpp-python이 설치되어 있지 않습니다.")
         if not self.llm_model_path or not os.path.exists(self.llm_model_path):
-            raise RuntimeError("LLM 모델(.gguf) 경로가 유효하지 않습니다. 인덱싱 옵션에서 모델 파일을 지정하세요.")
+            raise RuntimeError("LLM 모델(.gguf) 경로가 유효하지 않습니다.")
         if self._llm is None:
-            # n_gpu_layers=0 => CPU
-            self._llm = Llama(
-                model_path=self.llm_model_path,
-                n_ctx=int(self.llm_ctx),
-                n_threads=max(1, int(self.llm_threads)),
-                n_gpu_layers=0,
-                verbose=False,
-            )
+            self._llm = Llama(model_path=self.llm_model_path,
+                              n_ctx=int(self.llm_ctx),
+                              n_threads=max(1,int(self.llm_threads)),
+                              n_gpu_layers=0, verbose=False)
         return self._llm
 
     def run(self):
         if fitz is None:
-            self.q.put(("fatal", "PyMuPDF(pymupdf)가 필요합니다: pip install pymupdf")); return
-
+            self.q.put(("fatal","PyMuPDF가 필요합니다: pip install pymupdf")); return
         db = None
         try:
-            db = IndexDB(self.db_path)
-            self._index(db)
-            self.q.put(("done", None))
+            db = IndexDB(self.db_path); self._index(db); self.q.put(("done",None))
         except Exception as e:
-            self.q.put(("fatal", f"{e}\n\n{traceback.format_exc()}"))
+            self.q.put(("fatal",f"{e}\n\n{traceback.format_exc()}"))
         finally:
-            if db:
-                db.close()
+            if db: db.close()
 
-    def _collect_pdfs(self) -> List[str]:
-        out: List[str] = []
-        for base, _, files in os.walk(self.root_folder):
-            if self.cancel.is_set():
-                break
+    def _collect_pdfs(self):
+        out = []
+        for base,_,files in os.walk(self.root_folder):
+            if self.cancel.is_set(): break
             for fn in files:
-                if is_pdf(fn):
-                    out.append(os.path.join(base, fn))
+                if fn.lower().endswith(".pdf"): out.append(os.path.join(base,fn))
         return out
 
-    def _index(self, db: IndexDB):
-        pdfs = self._collect_pdfs()
-        total = len(pdfs)
-        self.q.put(("scan", total))
-
+    def _index(self, db):
+        pdfs = self._collect_pdfs(); total = len(pdfs)
+        self.q.put(("scan",total))
         existing = db.list_document_paths()
-        current_set = set(pdfs)
-        deleted = sorted(existing - current_set)
-        for path in deleted:
-            if self.cancel.is_set():
-                self.q.put(("canceled", None)); return
-            db.delete_document_by_path(path)
-            self.q.put(("deleted", path))
+        for path in sorted(existing-set(pdfs)):
+            if self.cancel.is_set(): self.q.put(("canceled",None)); return
+            db.delete_document_by_path(path); self.q.put(("deleted",path))
 
-        to_process: List[str] = []
-        metas: Dict[str, Tuple[int, int]] = {}
+        to_process,metas = [],{}
         for path in pdfs:
-            if self.cancel.is_set():
-                self.q.put(("canceled", None)); return
+            if self.cancel.is_set(): self.q.put(("canceled",None)); return
             try:
-                st = os.stat(path)
-                mtime = int(st.st_mtime)
-                size = int(st.st_size)
-                metas[path] = (mtime, size)
+                st = os.stat(path); mtime,size = int(st.st_mtime),int(st.st_size)
+                metas[path] = (mtime,size)
                 meta = db.get_document_meta(path)
-                needs = True
-                if meta:
-                    _, old_mtime, old_size = meta
-                    if old_mtime == mtime and old_size == size:
-                        needs = False
-                if needs:
-                    to_process.append(path)
-            except Exception:
-                to_process.append(path)
+                if not (meta and meta[1]==mtime and meta[2]==size): to_process.append(path)
+            except: to_process.append(path)
+        self.q.put(("plan",(len(to_process),total)))
 
-        self.q.put(("plan", (len(to_process), total)))
-
-        errors: List[IndexErrorItem] = []
-
-        # LLM은 인덱싱 스레드에서만 사용(프로세스 풀과 섞지 않음)
+        errors = []
         llm = self._get_llm() if self.build_summary else None
 
+        def process_one(path, pages_text):
+            mtime,size = metas.get(path,(int(os.stat(path).st_mtime),int(os.stat(path).st_size)))
+            doc_id = db.upsert_document(path,mtime,size,status="ok")
+            db.replace_pages(doc_id,pages_text,build_ngram=self.build_ngram)
+            if self.build_summary and llm:
+                doc_text = build_doc_text_for_summary(pages_text)
+                self.q.put(("llm",f"요약 생성 중: {os.path.basename(path)}"))
+                summ = llm_summarize(llm, doc_text)
+                db.upsert_doc_summary(doc_id, summ)
+            db.upsert_document(path,mtime,size,status="ok")
+
         if not self.parallel or len(to_process) <= 1:
-            for idx, path in enumerate(pdfs, start=1):
-                if self.cancel.is_set():
-                    self.q.put(("canceled", None)); return
-                self.q.put(("progress", IndexProgress(idx, total, path)))
-                if path not in to_process:
-                    continue
-                try:
-                    mtime, size = metas.get(path, (int(os.stat(path).st_mtime), int(os.stat(path).st_size)))
-                    doc_id = db.upsert_document(path, mtime, size, status="ok")
-                    pages_text = extract_pdf_text_pages(path)
-                    db.replace_pages(doc_id, pages_text, build_ngram=self.build_ngram)
-
-                    if self.build_summary and llm is not None:
-                        doc_text = build_doc_text_for_summary(pages_text)
-                        self.q.put(("llm", f"요약 생성 중: {os.path.basename(path)}"))
-                        summ = llm_summarize(llm, doc_text, max_chars_in=60_000, max_tokens_out=240)
-                        db.upsert_doc_summary(doc_id, summ)
-
-                    db.upsert_document(path, mtime, size, status="ok")
+            for idx,path in enumerate(pdfs,1):
+                if self.cancel.is_set(): self.q.put(("canceled",None)); return
+                self.q.put(("progress",IndexProgress(idx,total,path)))
+                if path not in to_process: continue
+                try: process_one(path, extract_pdf_text_pages(path))
                 except Exception as e:
-                    errors.append(IndexErrorItem(path, str(e)))
-                    try:
-                        st2 = os.stat(path)
-                        db.upsert_document(path, int(st2.st_mtime), int(st2.st_size), status="error")
-                    except Exception:
-                        pass
-                    self.q.put(("error", errors[-1]))
+                    errors.append(IndexErrorItem(path,str(e)))
+                    try: st2=os.stat(path); db.upsert_document(path,int(st2.st_mtime),int(st2.st_size),status="error")
+                    except: pass
+                    self.q.put(("error",errors[-1]))
         else:
-            workers = max(1, min(self.max_workers, os.cpu_count() or 2))
-            self.q.put(("parallel", workers))
+            workers = max(1,min(self.max_workers,os.cpu_count() or 2))
+            self.q.put(("parallel",workers))
             futures = {}
             with ProcessPoolExecutor(max_workers=workers) as ex:
                 for path in to_process:
-                    if self.cancel.is_set():
-                        self.q.put(("canceled", None)); return
-                    futures[ex.submit(extract_pdf_text_pages, path)] = path
-
+                    if self.cancel.is_set(): self.q.put(("canceled",None)); return
+                    futures[ex.submit(extract_pdf_text_pages,path)] = path
                 done_count = 0
                 for fut in as_completed(futures):
-                    if self.cancel.is_set():
-                        self.q.put(("canceled", None)); return
-                    path = futures[fut]
-                    done_count += 1
-                    self.q.put(("extract_done", (done_count, len(to_process), path)))
-                    try:
-                        pages_text = fut.result()
-                        mtime, size = metas.get(path, (int(os.stat(path).st_mtime), int(os.stat(path).st_size)))
-                        doc_id = db.upsert_document(path, mtime, size, status="ok")
-                        db.replace_pages(doc_id, pages_text, build_ngram=self.build_ngram)
-
-                        if self.build_summary and llm is not None:
-                            doc_text = build_doc_text_for_summary(pages_text)
-                            self.q.put(("llm", f"요약 생성 중: {os.path.basename(path)}"))
-                            summ = llm_summarize(llm, doc_text, max_chars_in=60_000, max_tokens_out=240)
-                            db.upsert_doc_summary(doc_id, summ)
-
-                        db.upsert_document(path, mtime, size, status="ok")
+                    if self.cancel.is_set(): self.q.put(("canceled",None)); return
+                    path = futures[fut]; done_count += 1
+                    self.q.put(("extract_done",(done_count,len(to_process),path)))
+                    try: process_one(path, fut.result())
                     except Exception as e:
-                        errors.append(IndexErrorItem(path, str(e)))
-                        try:
-                            st2 = os.stat(path)
-                            db.upsert_document(path, int(st2.st_mtime), int(st2.st_size), status="error")
-                        except Exception:
-                            pass
-                        self.q.put(("error", errors[-1]))
+                        errors.append(IndexErrorItem(path,str(e)))
+                        try: st2=os.stat(path); db.upsert_document(path,int(st2.st_mtime),int(st2.st_size),status="error")
+                        except: pass
+                        self.q.put(("error",errors[-1]))
+        self.q.put(("errors_done",errors))
 
-        self.q.put(("errors_done", errors))
+# ══════════════════════════════════════════════
+#  Custom UI widgets  (shared style)
+# ══════════════════════════════════════════════
 
-# -----------------------------
-# Synonyms dialog (same as no-llm but included)
-# -----------------------------
+class FlatButton(tk.Canvas):
+    def __init__(self, parent, text, command=None,
+                 bg=C["panel2"], fg=C["text"], hbg=C["hover"],
+                 accent=False, small=False, **kw):
+        px = 10 if small else 14
+        py = 4  if small else 7
+        fs = 10 if small else 12
+        self._text = text
+        self._bg   = C["accent"] if accent else bg
+        self._fg   = C["text_inv"] if accent else fg
+        self._hbg  = C["accent2"] if accent else hbg
+        self._cmd  = command
+        fnt = pfont(SANS, fs, "bold" if accent else "normal")
+        tmp = tk.Label(parent, text=text, font=fnt)
+        tw,th = tmp.winfo_reqwidth(), tmp.winfo_reqheight(); tmp.destroy()
+        w,h = tw+px*2, th+py*2
+        super().__init__(parent, width=w, height=h,
+                         bg=C["bg"], highlightthickness=0, **kw)
+        self._w,self._h,self._fnt = w,h,fnt
+        self._r = h//2
+        self._draw(self._bg)
+        self.bind("<Enter>",           lambda e: self._draw(self._hbg))
+        self.bind("<Leave>",           lambda e: self._draw(self._bg))
+        self.bind("<Button-1>",        lambda e: self._draw(C["active"]))
+        self.bind("<ButtonRelease-1>", lambda e: (self._draw(self._bg), self._cmd() if self._cmd else None))
+
+    def _draw(self, color):
+        self.delete("all")
+        r,w,h = self._r,self._w,self._h
+        self.create_arc(0,0,r*2,h,   start=90,  extent=180, fill=color, outline="")
+        self.create_arc(w-r*2,0,w,h, start=270, extent=180, fill=color, outline="")
+        self.create_rectangle(r,0,w-r,h, fill=color, outline="")
+        self.create_text(w//2,h//2, text=self._text, fill=self._fg, font=self._fnt)
+
+
+class SearchBar(tk.Frame):
+    def __init__(self, parent, textvariable=None, placeholder="검색어 입력…", **kw):
+        super().__init__(parent, bg=C["input_bg"],
+                         highlightbackground=C["border"], highlightthickness=1, **kw)
+        self._ph  = placeholder
+        self._var = textvariable or tk.StringVar()
+        fnt = pfont(SANS,13)
+        ico = tk.Label(self, text="⌕", bg=C["input_bg"], fg=C["text3"], font=pfont(SANS,15))
+        ico.pack(side="left", padx=(10,4))
+        self.entry = tk.Entry(self, textvariable=self._var, bd=0,
+                              bg=C["input_bg"], fg=C["text"],
+                              insertbackground=C["accent"],
+                              selectbackground=C["accent_dim"],
+                              selectforeground=C["accent_text"],
+                              font=fnt, relief="flat")
+        self.entry.pack(side="left", fill="both", expand=True, padx=(0,12), pady=7)
+        self.entry.bind("<FocusIn>",  self._on_focus)
+        self.entry.bind("<FocusOut>", self._on_blur)
+        ico.bind("<Button-1>", lambda e: self.entry.focus_set())
+        if not self._var.get(): self._show_ph()
+
+    def _show_ph(self):
+        self.entry.config(fg=C["text3"])
+        self.entry.delete(0,"end"); self.entry.insert(0,self._ph)
+
+    def _on_focus(self, e):
+        self.configure(highlightbackground=C["accent"])
+        if self.entry.get() == self._ph:
+            self.entry.delete(0,"end"); self.entry.config(fg=C["text"])
+
+    def _on_blur(self, e):
+        self.configure(highlightbackground=C["border"])
+        if not self.entry.get(): self._show_ph()
+
+    def get(self):
+        v = self._var.get()
+        return "" if v == self._ph else v
+
+
+class Toggle(tk.Frame):
+    def __init__(self, parent, text, variable, **kw):
+        super().__init__(parent, bg=C["panel"], **kw)
+        self._var = variable
+        self._cv  = tk.Canvas(self, width=36, height=20, bg=C["panel"], highlightthickness=0)
+        self._cv.pack(side="left", padx=(0,7))
+        tk.Label(self, text=text, bg=C["panel"], fg=C["text2"],
+                 font=pfont(SANS,11)).pack(side="left")
+        self._draw()
+        self._cv.bind("<Button-1>", self._toggle)
+        self.bind("<Button-1>",     self._toggle)
+
+    def _toggle(self, e=None):
+        self._var.set(not self._var.get()); self._draw()
+
+    def _draw(self):
+        self._cv.delete("all")
+        on = self._var.get()
+        bg = C["accent"] if on else C["border"]
+        self._cv.create_arc(1,1,19,19,   start=90,  extent=180, fill=bg, outline="")
+        self._cv.create_arc(17,1,35,19,  start=270, extent=180, fill=bg, outline="")
+        self._cv.create_rectangle(10,1,26,19, fill=bg, outline="")
+        x = 26 if on else 10
+        self._cv.create_oval(x-7,3,x+7,17, fill="white", outline="")
+
+
+class ProgressStrip(tk.Canvas):
+    def __init__(self, parent, **kw):
+        super().__init__(parent, height=4, bg=C["border_soft"], highlightthickness=0, **kw)
+        self._pct = 0.0
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, pct):
+        self._pct = max(0.0,min(100.0,pct)); self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width() or 1; h = self.winfo_height() or 4
+        self.create_rectangle(0,0,w,h, fill=C["border_soft"], outline="")
+        filled = int(w*self._pct/100)
+        if filled > 0: self.create_rectangle(0,0,filled,h, fill=C["accent"], outline="")
+
+
+class StatusDot(tk.Canvas):
+    _COLORS = {"idle":C["text3"],"running":C["yellow"],"ok":C["green"],"error":C["red"]}
+    def __init__(self, parent, **kw):
+        super().__init__(parent, width=10, height=10,
+                         bg=C["panel"], highlightthickness=0, **kw)
+        self._status = "idle"; self._draw()
+
+    def set_status(self, status):
+        self._status = status; self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        color = self._COLORS.get(self._status, C["text3"])
+        self.create_oval(1,1,9,9, fill=color, outline="")
+
+
+class LLMBadge(tk.Canvas):
+    """Small 'LLM' label badge shown when summary mode is on."""
+    def __init__(self, parent, **kw):
+        super().__init__(parent, width=42, height=18,
+                         bg=C["panel"], highlightthickness=0, **kw)
+        self._on = False; self._draw()
+
+    def set(self, on: bool):
+        self._on = on; self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        if not self._on: return
+        self.create_arc(0,0,18,18,   start=90,  extent=180, fill=C["llm_bg"], outline="")
+        self.create_arc(24,0,42,18,  start=270, extent=180, fill=C["llm_bg"], outline="")
+        self.create_rectangle(9,0,33,18, fill=C["llm_bg"], outline="")
+        self.create_text(21,9, text="LLM", fill=C["llm_fg"],
+                         font=pfont(SANS,9,"bold"))
+
+# ══════════════════════════════════════════════
+#  Synonyms dialog
+# ══════════════════════════════════════════════
 class SynonymsDialog(tk.Toplevel):
-    def __init__(self, parent, db_path: str, on_changed_callback):
+    def __init__(self, parent, db_path, on_changed_callback):
         super().__init__(parent)
         self.title("동의어 관리")
-        self.geometry("900x560")
-        self.minsize(800, 520)
+        self.geometry("820x540")
+        self.configure(bg=C["bg"])
         self.db_path = db_path
         self.on_changed_callback = on_changed_callback
-        self.term_var = tk.StringVar(value="")
-        self.syn_var = tk.StringVar(value="")
-        self.filter_var = tk.StringVar(value="")
-        self._build()
-        self._reload()
+        self.term_var   = tk.StringVar()
+        self.syn_var    = tk.StringVar()
+        self.filter_var = tk.StringVar()
+        self._build(); self._reload()
 
     def _build(self):
-        top = ttk.Frame(self, padding=10); top.pack(fill="x")
-        ttk.Label(top, text="필터:").pack(side="left")
-        ttk.Entry(top, textvariable=self.filter_var, width=30).pack(side="left", padx=6)
-        ttk.Button(top, text="적용", command=self._reload).pack(side="left")
-        ttk.Button(top, text="synonyms.json 내보내기", command=self._export).pack(side="right", padx=4)
-        ttk.Button(top, text="synonyms.json 가져오기", command=self._import).pack(side="right", padx=4)
+        hdr = tk.Frame(self, bg=C["sidebar"], padx=18, pady=12); hdr.pack(fill="x")
+        tk.Label(hdr, text="동의어 사전", bg=C["sidebar"], fg=C["text"],
+                 font=pfont(SANS,14,"bold")).pack(side="left")
+        FlatButton(hdr,"JSON 내보내기",self._export,small=True).pack(side="right",padx=(4,0))
+        FlatButton(hdr,"JSON 가져오기",self._import,small=True).pack(side="right",padx=4)
 
-        mid = ttk.Frame(self, padding=(10, 0, 10, 10)); mid.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(mid, columns=("term", "syn"), show="headings")
-        self.tree.heading("term", text="term")
-        self.tree.heading("syn", text="synonym")
-        self.tree.column("term", width=300, anchor="w")
-        self.tree.column("syn", width=540, anchor="w")
-        vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        fb = tk.Frame(self, bg=C["bg"], padx=16, pady=10); fb.pack(fill="x")
+        self._fbar = SearchBar(fb, textvariable=self.filter_var, placeholder="필터…")
+        self._fbar.pack(side="left", fill="x", expand=True)
+        FlatButton(fb,"적용",self._reload,small=True).pack(side="left",padx=8)
+
+        tbl = tk.Frame(self, bg=C["bg"], padx=16); tbl.pack(fill="both", expand=True)
+        style = ttk.Style()
+        style.configure("Syn.Treeview",
+                        background=C["panel"],fieldbackground=C["panel"],
+                        foreground=C["text"],rowheight=30,borderwidth=0,
+                        font=pfont(SANS,11))
+        style.configure("Syn.Treeview.Heading",
+                        background=C["panel2"],foreground=C["text2"],
+                        relief="flat",font=pfont(SANS,10),borderwidth=0)
+        style.map("Syn.Treeview",
+                  background=[("selected",C["accent_dim"])],
+                  foreground=[("selected",C["accent_text"])])
+        self.tree = ttk.Treeview(tbl,columns=("term","syn"),show="headings",style="Syn.Treeview")
+        self.tree.heading("term",text="Term"); self.tree.heading("syn",text="Synonym")
+        self.tree.column("term",width=260,anchor="w"); self.tree.column("syn",width=480,anchor="w")
+        vsb = ttk.Scrollbar(tbl,orient="vertical",command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        self.tree.pack(side="left",fill="both",expand=True); vsb.pack(side="right",fill="y")
 
-        bottom = ttk.LabelFrame(self, text="추가/삭제", padding=10); bottom.pack(fill="x", padx=10, pady=(0, 10))
-        row1 = ttk.Frame(bottom); row1.pack(fill="x")
-        ttk.Label(row1, text="term").pack(side="left")
-        ttk.Entry(row1, textvariable=self.term_var, width=30).pack(side="left", padx=6)
-        ttk.Label(row1, text="synonym").pack(side="left")
-        ttk.Entry(row1, textvariable=self.syn_var, width=45).pack(side="left", padx=6)
-        ttk.Button(row1, text="추가", command=self._add).pack(side="left", padx=6)
+        bot = tk.Frame(self, bg=C["sidebar"], padx=16, pady=12); bot.pack(fill="x")
+        r1 = tk.Frame(bot, bg=C["sidebar"]); r1.pack(fill="x", pady=(0,8))
+        tk.Label(r1,text="Term",bg=C["sidebar"],fg=C["text2"],
+                 font=pfont(SANS,10),width=6,anchor="w").pack(side="left")
+        tk.Entry(r1,textvariable=self.term_var,width=20,bd=0,relief="flat",
+                 bg=C["input_bg"],fg=C["text"],font=pfont(SANS,11),
+                 insertbackground=C["accent"]).pack(side="left",ipady=5,ipadx=6,padx=(4,14))
+        tk.Label(r1,text="Synonym",bg=C["sidebar"],fg=C["text2"],
+                 font=pfont(SANS,10)).pack(side="left")
+        tk.Entry(r1,textvariable=self.syn_var,width=32,bd=0,relief="flat",
+                 bg=C["input_bg"],fg=C["text"],font=pfont(SANS,11),
+                 insertbackground=C["accent"]).pack(side="left",ipady=5,ipadx=6,padx=(4,12))
+        FlatButton(r1,"추가",self._add,accent=True,small=True).pack(side="left")
 
-        row2 = ttk.Frame(bottom); row2.pack(fill="x", pady=(8, 0))
-        ttk.Button(row2, text="선택 항목 삭제", command=self._delete_selected).pack(side="left")
-        ttk.Button(row2, text="선택 term 전체 삭제", command=self._delete_term).pack(side="left", padx=6)
-
-        self.status = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self.status).pack(anchor="w", pady=(8, 0))
+        r2 = tk.Frame(bot, bg=C["sidebar"]); r2.pack(fill="x")
+        FlatButton(r2,"선택 삭제",      self._delete_selected,small=True).pack(side="left",padx=(0,8))
+        FlatButton(r2,"Term 전체 삭제", self._delete_term,    small=True).pack(side="left")
+        self.status_lbl = tk.Label(r2,text="",bg=C["sidebar"],fg=C["text3"],font=pfont(SANS,10))
+        self.status_lbl.pack(side="right")
 
     def _reload(self):
-        for it in self.tree.get_children():
-            self.tree.delete(it)
+        for it in self.tree.get_children(): self.tree.delete(it)
         flt = self.filter_var.get().strip().lower()
-        db = IndexDB(self.db_path)
-        mp = db.load_synonyms_map()
-        db.close()
-        rows = []
-        for term, syns in mp.items():
-            for s in syns:
-                if flt and (flt not in term.lower() and flt not in s.lower()):
-                    continue
-                rows.append((term, s))
-        rows.sort(key=lambda x: (x[0].lower(), x[1].lower()))
-        for term, s in rows:
-            self.tree.insert("", "end", values=(term, s))
-        self.status.set(f"총 {len(rows)}개 항목 표시 중")
+        if flt == "필터…": flt = ""
+        db = IndexDB(self.db_path); mp = db.load_synonyms_map(); db.close()
+        rows = [(t,s) for t,ss in mp.items() for s in ss
+                if not flt or flt in t.lower() or flt in s.lower()]
+        rows.sort(key=lambda x:(x[0].lower(),x[1].lower()))
+        for t,s in rows: self.tree.insert("","end",values=(t,s))
+        self.status_lbl.config(text=f"{len(rows)}개 항목")
 
     def _add(self):
-        term = self.term_var.get().strip()
-        syn = self.syn_var.get().strip()
-        if not term or not syn:
-            messagebox.showwarning("값 필요", "term과 synonym을 입력하세요.")
-            return
-        db = IndexDB(self.db_path)
-        db.add_synonym(term, syn)
-        db.close()
+        t,s = self.term_var.get().strip(), self.syn_var.get().strip()
+        if not t or not s: messagebox.showwarning("값 필요","Term과 Synonym을 입력하세요."); return
+        db = IndexDB(self.db_path); db.add_synonym(t,s); db.close()
         self.term_var.set(""); self.syn_var.set("")
-        self._reload()
-        self.on_changed_callback()
+        self._reload(); self.on_changed_callback()
 
     def _delete_selected(self):
         sel = self.tree.selection()
-        if not sel:
-            return
-        term, syn = self.tree.item(sel[0], "values")
-        db = IndexDB(self.db_path)
-        db.delete_synonym(term, syn)
-        db.close()
-        self._reload()
-        self.on_changed_callback()
+        if not sel: return
+        t,s = self.tree.item(sel[0],"values")
+        db = IndexDB(self.db_path); db.delete_synonym(t,s); db.close()
+        self._reload(); self.on_changed_callback()
 
     def _delete_term(self):
         sel = self.tree.selection()
-        if not sel:
-            return
-        term, _ = self.tree.item(sel[0], "values")
-        if messagebox.askyesno("확인", f"term '{term}'의 모든 synonym을 삭제할까요?"):
-            db = IndexDB(self.db_path)
-            db.delete_term(term)
-            db.close()
-            self._reload()
-            self.on_changed_callback()
+        if not sel: return
+        t,_ = self.tree.item(sel[0],"values")
+        if messagebox.askyesno("확인",f"'{t}'의 모든 synonym을 삭제할까요?"):
+            db = IndexDB(self.db_path); db.delete_term(t); db.close()
+            self._reload(); self.on_changed_callback()
 
     def _export(self):
         try:
-            db = IndexDB(self.db_path)
-            db.export_synonyms_to_json(SYNONYMS_JSON)
-            db.close()
-            messagebox.showinfo("완료", f"{SYNONYMS_JSON}로 내보냈습니다.")
-        except Exception as e:
-            messagebox.showerror("실패", str(e))
+            db = IndexDB(self.db_path); db.export_synonyms_to_json(SYNONYMS_JSON); db.close()
+            messagebox.showinfo("완료",f"{SYNONYMS_JSON}로 내보냈습니다.")
+        except Exception as e: messagebox.showerror("실패",str(e))
 
     def _import(self):
         try:
-            db = IndexDB(self.db_path)
-            db.import_synonyms_from_json(SYNONYMS_JSON)
-            db.close()
-            messagebox.showinfo("완료", f"{SYNONYMS_JSON}에서 가져왔습니다.")
-            self._reload()
-            self.on_changed_callback()
-        except Exception as e:
-            messagebox.showerror("실패", str(e))
+            db = IndexDB(self.db_path); db.import_synonyms_from_json(SYNONYMS_JSON); db.close()
+            messagebox.showinfo("완료",f"{SYNONYMS_JSON}에서 가져왔습니다.")
+            self._reload(); self.on_changed_callback()
+        except Exception as e: messagebox.showerror("실패",str(e))
 
-# -----------------------------
-# App
-# -----------------------------
+# ══════════════════════════════════════════════
+#  Settings dialog  (Viewer + LLM)
+# ══════════════════════════════════════════════
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, parent, settings, on_save):
+        super().__init__(parent)
+        self.title("뷰어 / LLM 설정")
+        self.geometry("700x440")
+        self.configure(bg=C["bg"])
+        self._s     = dict(settings)
+        self._save_cb = on_save
+        self._build()
+
+    def _build(self):
+        hdr = tk.Frame(self, bg=C["sidebar"], padx=18, pady=12); hdr.pack(fill="x")
+        tk.Label(hdr, text="설정", bg=C["sidebar"], fg=C["text"],
+                 font=pfont(SANS,14,"bold")).pack(side="left")
+
+        body = tk.Frame(self, bg=C["bg"], padx=22, pady=14); body.pack(fill="both", expand=True)
+
+        def sep():
+            tk.Frame(body, bg=C["border"], height=1).pack(fill="x", pady=10)
+
+        def lbl_row(text, row):
+            tk.Label(body, text=text, bg=C["bg"], fg=C["text2"],
+                     font=pfont(SANS,11), width=20, anchor="w").grid(row=row,column=0,sticky="w",pady=5)
+
+        # ── viewer section ──
+        tk.Label(body, text="PDF 뷰어", bg=C["bg"], fg=C["text"],
+                 font=pfont(SANS,12,"bold")).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,6))
+
+        self.mode_var  = tk.StringVar(value=self._s.get("viewer_mode",""))
+        self.vpath_var = tk.StringVar(value=self._s.get("viewer_path",""))
+        self.cargs_var = tk.StringVar(value=json.dumps(
+            self._s.get("viewer_custom_args",["{viewer}","{file}"]),ensure_ascii=False))
+
+        lbl_row("뷰어 모드", 1)
+        cb = ttk.Combobox(body, textvariable=self.mode_var, state="readonly",
+                           values=["","sumatra","acrobat","custom"], width=14)
+        cb.grid(row=1,column=1,sticky="w",padx=6)
+
+        lbl_row("뷰어 경로", 2)
+        tk.Entry(body, textvariable=self.vpath_var, width=40, bd=0, relief="flat",
+                 bg=C["input_bg"], fg=C["text"], font=pfont(SANS,11),
+                 insertbackground=C["accent"]).grid(row=2,column=1,sticky="w",padx=6,ipady=4,ipadx=4)
+        FlatButton(body,"찾기",self._pick_exe,small=True).grid(row=2,column=2,padx=4)
+
+        lbl_row("Custom args", 3)
+        tk.Entry(body, textvariable=self.cargs_var, width=40, bd=0, relief="flat",
+                 bg=C["input_bg"], fg=C["text"], font=pfont(MONO,10),
+                 insertbackground=C["accent"]).grid(row=3,column=1,sticky="w",padx=6,ipady=4,ipadx=4)
+
+        # ── separator frame trick for grid ──
+        tk.Frame(body, bg=C["border"], height=1)\
+            .grid(row=4,column=0,columnspan=3,sticky="ew",pady=12)
+
+        # ── LLM section ──
+        tk.Label(body, text="로컬 LLM (요약)", bg=C["bg"], fg=C["text"],
+                 font=pfont(SANS,12,"bold")).grid(row=5,column=0,columnspan=3,sticky="w",pady=(0,6))
+
+        self.llm_path_var = tk.StringVar(value=self._s.get("llm_model_path",""))
+        self.ctx_var      = tk.IntVar(value=int(self._s.get("llm_ctx",2048)))
+        self.thr_var      = tk.IntVar(value=int(self._s.get("llm_threads",max(1,(os.cpu_count() or 4)-1))))
+
+        lbl_row("GGUF 모델 경로", 6)
+        tk.Entry(body, textvariable=self.llm_path_var, width=40, bd=0, relief="flat",
+                 bg=C["input_bg"], fg=C["text"], font=pfont(SANS,11),
+                 insertbackground=C["accent"]).grid(row=6,column=1,sticky="w",padx=6,ipady=4,ipadx=4)
+        FlatButton(body,"찾기",self._pick_gguf,small=True).grid(row=6,column=2,padx=4)
+
+        lbl_row("Context / 스레드", 7)
+        ctx_frame = tk.Frame(body, bg=C["bg"]); ctx_frame.grid(row=7,column=1,sticky="w",padx=6,pady=5)
+        tk.Spinbox(ctx_frame, from_=512, to=8192, textvariable=self.ctx_var, width=7,
+                   bg=C["input_bg"], fg=C["text"], bd=0,
+                   buttonbackground=C["panel2"], font=pfont(SANS,11))\
+            .pack(side="left")
+        tk.Label(ctx_frame, text="  스레드:", bg=C["bg"], fg=C["text2"],
+                 font=pfont(SANS,10)).pack(side="left")
+        tk.Spinbox(ctx_frame, from_=1, to=max(1,os.cpu_count() or 2),
+                   textvariable=self.thr_var, width=4,
+                   bg=C["input_bg"], fg=C["text"], bd=0,
+                   buttonbackground=C["panel2"], font=pfont(SANS,11))\
+            .pack(side="left")
+
+        btn_row = tk.Frame(body, bg=C["bg"]); btn_row.grid(row=8,column=1,sticky="e",pady=(14,0))
+        FlatButton(btn_row,"취소",self.destroy,small=True).pack(side="left",padx=(0,8))
+        FlatButton(btn_row,"저장",self._save,accent=True,small=True).pack(side="left")
+
+    def _pick_exe(self):
+        p = filedialog.askopenfilename(filetypes=[("EXE","*.exe"),("All","*.*")])
+        if p: self.vpath_var.set(p)
+
+    def _pick_gguf(self):
+        p = filedialog.askopenfilename(filetypes=[("GGUF","*.gguf"),("All","*.*")])
+        if p: self.llm_path_var.set(p)
+
+    def _save(self):
+        self._s["viewer_mode"]    = self.mode_var.get().strip()
+        self._s["viewer_path"]    = self.vpath_var.get().strip()
+        try:
+            args = json.loads(self.cargs_var.get().strip())
+            if not isinstance(args,list): raise ValueError
+            self._s["viewer_custom_args"] = args
+        except:
+            messagebox.showwarning("형식 오류","custom args는 JSON 배열이어야 합니다."); return
+        self._s["llm_model_path"] = self.llm_path_var.get().strip()
+        self._s["llm_ctx"]        = int(self.ctx_var.get())
+        self._s["llm_threads"]    = int(self.thr_var.get())
+        self._save_cb(self._s)
+        self.destroy()
+
+# ══════════════════════════════════════════════
+#  Main Application  (LLM variant)
+# ══════════════════════════════════════════════
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1220x840")
-        self.minsize(980, 660)
+        self.geometry("1260x840")
+        self.minsize(1000,680)
+        self.configure(bg=C["bg"])
 
-        self.db_path = os.path.join(os.getcwd(), DB_FILENAME)
-        self.event_q: queue.Queue = queue.Queue()
+        self.db_path      = os.path.join(os.getcwd(), DB_FILENAME)
+        self.event_q      = queue.Queue()
         self.cancel_event = threading.Event()
         self.indexer: Optional[IndexerThread] = None
+        self.syn_graph: Dict[str,Set[str]] = {}
+        self.settings     = self._load_settings()
+        self._result_map: Dict[str,Tuple[str,int]] = {}
 
-        self.syn_graph: Dict[str, Set[str]] = {}
-        self.settings = self._load_settings()
-
+        self._setup_ttk_styles()
         self._build_ui()
         self._ensure_db()
         self._load_synonyms()
         self._poll_events()
 
-    def _load_settings(self) -> dict:
+    # ── settings ──────────────────────────────
+    def _load_settings(self):
         if not os.path.exists(SETTINGS_JSON):
-            s = {
-                "viewer_mode": "",
-                "viewer_path": "",
-                "viewer_custom_args": ["{viewer}", "{file}"],
-                "llm_model_path": "",
-                "llm_ctx": 2048,
-                "llm_threads": max(1, (os.cpu_count() or 4) - 1),
-            }
-            with open(SETTINGS_JSON, "w", encoding="utf-8") as f:
-                json.dump(s, f, ensure_ascii=False, indent=2)
+            s = {"viewer_mode":"","viewer_path":"",
+                 "viewer_custom_args":["{viewer}","{file}"],
+                 "llm_model_path":"","llm_ctx":2048,
+                 "llm_threads":max(1,(os.cpu_count() or 4)-1)}
+            with open(SETTINGS_JSON,"w",encoding="utf-8") as f: json.dump(s,f,ensure_ascii=False,indent=2)
             return s
         try:
-            with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-        except Exception:
-            return {}
+            with open(SETTINGS_JSON,"r",encoding="utf-8") as f: return json.load(f) or {}
+        except: return {}
 
-    def _save_settings(self):
+    def _save_settings(self, new_settings):
+        self.settings = new_settings
         try:
-            with open(SETTINGS_JSON, "w", encoding="utf-8") as f:
-                json.dump(self.settings, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            messagebox.showwarning("설정 저장 실패", str(e))
+            with open(SETTINGS_JSON,"w",encoding="utf-8") as f:
+                json.dump(self.settings,f,ensure_ascii=False,indent=2)
+        except Exception as e: messagebox.showwarning("저장 실패",str(e))
 
     def _ensure_db(self):
-        try:
-            db = IndexDB(self.db_path); db.close()
-        except Exception as e:
-            messagebox.showerror("DB 초기화 실패", str(e))
-            self.destroy()
+        try: db=IndexDB(self.db_path); db.close()
+        except Exception as e: messagebox.showerror("DB 초기화 실패",str(e)); self.destroy()
 
     def _load_synonyms(self):
         try:
             db = IndexDB(self.db_path)
-            db.import_synonyms_from_json(SYNONYMS_JSON)
-            mp = db.load_synonyms_map()
-            db.close()
+            db.import_synonyms_from_json(SYNONYMS_JSON)  # JSON 파일 동의어
+            db.seed_bible_synonyms()                      # 성경 약어 사전 자동 등록
+            mp = db.load_synonyms_map(); db.close()
             self.syn_graph = build_graph(mp)
-            self.syn_status_var.set(f"동의어: {len(mp)}개 term 로드됨")
+            self._syn_lbl.config(text=f"동의어 {len(mp)}개 term 로드됨")
         except Exception as e:
             self.syn_graph = {}
-            self.syn_status_var.set(f"동의어 로드 실패: {e}")
+            self._syn_lbl.config(text=f"동의어 로드 실패: {e}")
 
+    def _setup_ttk_styles(self):
+        s = ttk.Style(); s.theme_use("clam")
+        s.configure("R.Treeview",
+                    background=C["panel"],fieldbackground=C["panel"],
+                    foreground=C["text"],rowheight=42,borderwidth=0,
+                    font=pfont(SANS,11))
+        s.configure("R.Treeview.Heading",
+                    background=C["sidebar"],foreground=C["text2"],
+                    relief="flat",font=pfont(SANS,10),borderwidth=0)
+        s.map("R.Treeview",
+              background=[("selected",C["accent_dim"])],
+              foreground=[("selected",C["accent_text"])])
+
+    # ── Build UI ──────────────────────────────
     def _build_ui(self):
-        top = ttk.Frame(self, padding=10); top.pack(fill="x")
-        self.folder_var = tk.StringVar(value="")
-        ttk.Label(top, text="대상 폴더:").pack(side="left")
-        ttk.Entry(top, textvariable=self.folder_var, width=62).pack(side="left", padx=6)
-        ttk.Button(top, text="폴더 선택", command=self.on_pick_folder).pack(side="left", padx=4)
-        ttk.Button(top, text="인덱싱 시작", command=self.on_start_index).pack(side="left", padx=4)
-        ttk.Button(top, text="취소", command=self.on_cancel_index).pack(side="left", padx=4)
-        ttk.Button(top, text="동의어 관리", command=self.on_manage_synonyms).pack(side="left", padx=8)
-        ttk.Button(top, text="뷰어/LLM 설정", command=self.on_settings).pack(side="left", padx=4)
+        # ─ Sidebar ─
+        sb = tk.Frame(self, bg=C["sidebar"], width=240)
+        sb.pack(side="left", fill="y"); sb.pack_propagate(False)
 
-        prog = ttk.Frame(self, padding=(10, 0, 10, 10)); prog.pack(fill="x")
-        self.progress_var = tk.DoubleVar(value=0.0)
-        ttk.Progressbar(prog, variable=self.progress_var, maximum=100).pack(fill="x")
-        self.status_var = tk.StringVar(value="준비됨. 폴더 선택 → 인덱싱.")
-        ttk.Label(prog, textvariable=self.status_var).pack(anchor="w", pady=(6, 0))
-        self.syn_status_var = tk.StringVar(value="")
-        ttk.Label(prog, textvariable=self.syn_status_var).pack(anchor="w", pady=(2, 0))
+        # logo — LLM variant uses purple tint
+        lf = tk.Frame(sb, bg=C["sidebar"], padx=16, pady=16); lf.pack(fill="x")
+        lc = tk.Canvas(lf, width=28, height=28, bg=C["sidebar"], highlightthickness=0)
+        lc.pack(side="left")
+        lc.create_oval(0,0,28,28, fill=C["llm_fg"], outline="")
+        lc.create_text(14,14, text="P", fill="white", font=pfont(SANS,13,"bold"))
+        tk.Label(lf, text="PDF Search", bg=C["sidebar"], fg=C["text"],
+                 font=pfont(SANS,14,"bold")).pack(side="left", padx=8)
+        # LLM badge next to title
+        self._llm_badge = LLMBadge(lf)
+        self._llm_badge.pack(side="left", padx=2)
 
-        opt = ttk.LabelFrame(self, text="인덱싱 옵션", padding=10)
-        opt.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=14)
 
-        self.build_ngram_var = tk.BooleanVar(value=False)
-        self.parallel_var = tk.BooleanVar(value=False)
-        self.workers_var = tk.IntVar(value=min(4, os.cpu_count() or 2))
+        # folder
+        fs = tk.Frame(sb, bg=C["sidebar"], padx=14, pady=14); fs.pack(fill="x")
+        tk.Label(fs, text="대상 폴더", bg=C["sidebar"], fg=C["text3"],
+                 font=pfont(SANS,9)).pack(anchor="w", pady=(0,5))
+        self.folder_var = tk.StringVar()
+        tk.Entry(fs, textvariable=self.folder_var, bd=0, relief="flat",
+                 bg=C["input_bg"], fg=C["text"], font=pfont(SANS,11),
+                 insertbackground=C["accent"]).pack(fill="x", ipady=5, ipadx=6)
+        FlatButton(fs,"📂  폴더 선택",self.on_pick_folder,small=True)\
+            .pack(fill="x", pady=(8,0))
+
+        tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=14)
+
+        # index options
+        io = tk.Frame(sb, bg=C["sidebar"], padx=14, pady=14); io.pack(fill="x")
+        tk.Label(io, text="인덱싱 옵션", bg=C["sidebar"], fg=C["text3"],
+                 font=pfont(SANS,9)).pack(anchor="w", pady=(0,10))
+        self.build_ngram_var   = tk.BooleanVar(value=False)
+        self.parallel_var      = tk.BooleanVar(value=False)
         self.build_summary_var = tk.BooleanVar(value=True)
+        self.workers_var       = tk.IntVar(value=min(4, os.cpu_count() or 2))
+        for txt, var in [("N-gram 인덱스",   self.build_ngram_var),
+                          ("병렬 추출",       self.parallel_var),
+                          ("LLM 요약 생성",  self.build_summary_var)]:
+            t = Toggle(io, txt, var); t.pack(anchor="w", pady=4)
+            if var is self.build_summary_var:
+                var.trace_add("write", lambda *_: self._llm_badge.set(self.build_summary_var.get()))
+        self._llm_badge.set(self.build_summary_var.get())
 
-        ttk.Checkbutton(opt, text="한국어 n-gram(2-gram) 보조 인덱스 생성", variable=self.build_ngram_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(opt, text="병렬 PDF 추출", variable=self.parallel_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(opt, text="workers:").grid(row=1, column=1, sticky="e", padx=(12, 2))
-        ttk.Spinbox(opt, from_=1, to=max(1, os.cpu_count() or 2), textvariable=self.workers_var, width=6).grid(row=1, column=2, sticky="w")
-        ttk.Checkbutton(opt, text="문서 요약 생성/갱신(로컬 LLM)", variable=self.build_summary_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        wr = tk.Frame(io, bg=C["sidebar"]); wr.pack(fill="x", pady=(8,0))
+        tk.Label(wr, text="Workers", bg=C["sidebar"], fg=C["text2"],
+                 font=pfont(SANS,10)).pack(side="left")
+        tk.Spinbox(wr, from_=1, to=max(1,os.cpu_count() or 2),
+                   textvariable=self.workers_var, width=4,
+                   bg=C["input_bg"], fg=C["text"], bd=0,
+                   buttonbackground=C["panel2"], font=pfont(SANS,10))\
+            .pack(side="right")
 
-        search = ttk.LabelFrame(self, text="검색", padding=10)
-        search.pack(fill="x", padx=10, pady=(0, 10))
-        self.query_var = tk.StringVar(value="")
-        ttk.Label(search, text='검색어("따옴표" 구문 가능):').grid(row=0, column=0, sticky="w")
-        ttk.Entry(search, textvariable=self.query_var, width=72).grid(row=0, column=1, sticky="w", padx=6)
+        ab = tk.Frame(sb, bg=C["sidebar"], padx=14); ab.pack(fill="x")
+        FlatButton(ab,"인덱싱 시작",self.on_start_index,accent=True)\
+            .pack(fill="x", pady=(0,6))
+        FlatButton(ab,"취소",self.on_cancel_index).pack(fill="x")
 
-        self.expand_var = tk.BooleanVar(value=False)
-        self.ngram_search_var = tk.BooleanVar(value=False)
-        self.summary_search_var = tk.BooleanVar(value=False)
+        tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=14, pady=12)
 
-        ttk.Checkbutton(search, text="동의어 확장", variable=self.expand_var).grid(row=0, column=2, sticky="w", padx=6)
-        ttk.Checkbutton(search, text="n-gram 보조 검색", variable=self.ngram_search_var).grid(row=0, column=3, sticky="w", padx=6)
-        ttk.Checkbutton(search, text="요약(문서) 검색", variable=self.summary_search_var).grid(row=0, column=4, sticky="w", padx=6)
-        ttk.Button(search, text="검색", command=self.on_search).grid(row=0, column=5, sticky="w", padx=6)
+        nav = tk.Frame(sb, bg=C["sidebar"], padx=10); nav.pack(fill="x")
+        self._nav_btn(nav, "📖  동의어 관리", self.on_manage_synonyms)
+        self._nav_btn(nav, "⚙   뷰어 / LLM 설정", self.on_settings)
 
-        mid = ttk.Frame(self, padding=(10, 0, 10, 10))
-        mid.pack(fill="both", expand=True)
-        cols = ("path", "page", "snippet", "src")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings")
-        for c, t, w in [("path","파일 경로",560), ("page","페이지",70), ("snippet","스니펫",480), ("src","출처",70)]:
-            self.tree.heading(c, text=t); self.tree.column(c, width=w, anchor="w" if c!="page" and c!="src" else "center")
-        vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(mid, orient="horizontal", command=self.tree.xview)
+        self._syn_lbl = tk.Label(sb, text="", bg=C["sidebar"], fg=C["text3"],
+                                  font=pfont(SANS,9), wraplength=200, justify="left")
+        self._syn_lbl.pack(side="bottom", padx=14, pady=10, anchor="w")
+
+        # ─ Main content ─
+        main = tk.Frame(self, bg=C["bg"]); main.pack(side="left", fill="both", expand=True)
+
+        tb = tk.Frame(main, bg=C["panel"], padx=18, pady=14); tb.pack(fill="x")
+        sr = tk.Frame(tb, bg=C["panel"]); sr.pack(fill="x")
+        self.query_var = tk.StringVar()
+        self._sbar = SearchBar(sr, textvariable=self.query_var,
+                                placeholder='검색어 입력… (구문은 "따옴표" 사용)')
+        self._sbar.pack(side="left", fill="x", expand=True)
+        self._sbar.entry.bind("<Return>", lambda e: self.on_search())
+        FlatButton(sr,"검색",self.on_search,accent=True).pack(side="left",padx=(10,0))
+
+        fr = tk.Frame(tb, bg=C["panel"]); fr.pack(fill="x", pady=(10,0))
+        self.expand_var        = tk.BooleanVar(value=False)
+        self.ngram_search_var  = tk.BooleanVar(value=False)
+        self.summary_search_var= tk.BooleanVar(value=False)
+        for txt, var in [("동의어 확장",  self.expand_var),
+                          ("N-gram 검색", self.ngram_search_var),
+                          ("요약 검색",   self.summary_search_var)]:
+            t = Toggle(fr, txt, var); t.pack(side="left", padx=(0,20))
+
+        self._prog = ProgressStrip(main); self._prog.pack(fill="x")
+
+        stbar = tk.Frame(main, bg=C["panel"], padx=18, pady=7); stbar.pack(fill="x")
+        self._sdot = StatusDot(stbar); self._sdot.pack(side="left")
+        self._stxt = tk.Label(stbar, text="폴더를 선택하고 인덱싱을 시작하세요.",
+                               bg=C["panel"], fg=C["text2"], font=pfont(SANS,11))
+        self._stxt.pack(side="left", padx=8)
+        self._rcnt = tk.Label(stbar, text="", bg=C["panel"],
+                               fg=C["text3"], font=pfont(SANS,10))
+        self._rcnt.pack(side="right")
+
+        rf = tk.Frame(main, bg=C["bg"]); rf.pack(fill="both", expand=True)
+        cols = ("path","page","snippet","src")
+        self.tree = ttk.Treeview(rf, columns=cols, show="headings", style="R.Treeview")
+        self.tree.heading("path",    text="파일 경로")
+        self.tree.heading("page",    text="페이지")
+        self.tree.heading("snippet", text="미리보기")
+        self.tree.heading("src",     text="출처")
+        self.tree.column("path",    width=440, anchor="w")
+        self.tree.column("page",    width=66,  anchor="center")
+        self.tree.column("snippet", width=520, anchor="w")
+        self.tree.column("src",     width=68,  anchor="center")
+        vsb = ttk.Scrollbar(rf, orient="vertical",   command=self.tree.yview)
+        hsb = ttk.Scrollbar(rf, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        mid.grid_rowconfigure(0, weight=1); mid.grid_columnconfigure(0, weight=1)
+        self.tree.grid(row=0,column=0,sticky="nsew")
+        vsb.grid(row=0,column=1,sticky="ns")
+        hsb.grid(row=1,column=0,sticky="ew")
+        rf.grid_rowconfigure(0,weight=1); rf.grid_columnconfigure(0,weight=1)
+        self.tree.tag_configure("odd",  background=C["panel"])
+        self.tree.tag_configure("even", background=C["panel2"])
         self.tree.bind("<Double-1>", self.on_open_selected)
 
-        bottom = ttk.LabelFrame(self, text="오류 목록/상태", padding=10)
-        bottom.pack(fill="both", padx=10, pady=(0, 10))
-        self.err_text = tk.Text(bottom, height=7, wrap="word")
+        self._err_open = False
+        et = tk.Frame(main, bg=C["sidebar"], padx=16, pady=5, cursor="hand2"); et.pack(fill="x")
+        self._etgl = tk.Label(et, text="▶  오류 로그", bg=C["sidebar"],
+                               fg=C["text3"], font=pfont(SANS,10), cursor="hand2")
+        self._etgl.pack(side="left")
+        et.bind("<Button-1>", self._toggle_err)
+        self._etgl.bind("<Button-1>", self._toggle_err)
+        self._err_frame = tk.Frame(main, bg=C["sidebar"])
+        self.err_text = tk.Text(self._err_frame, height=5, wrap="word",
+                                 bg=C["red_bg"], fg=C["red"],
+                                 font=pfont(MONO,10), bd=0, relief="flat",
+                                 padx=16, pady=10)
         self.err_text.pack(fill="both", expand=True)
 
+    def _nav_btn(self, parent, label, cmd):
+        f = tk.Frame(parent, bg=C["sidebar"], cursor="hand2"); f.pack(fill="x", pady=2)
+        inner = tk.Frame(f, bg=C["sidebar"], padx=10, pady=7); inner.pack(fill="x")
+        tk.Label(inner, text=label, bg=C["sidebar"], fg=C["text2"],
+                 font=pfont(SANS,11)).pack(side="left")
+        def on_enter(e): inner.config(bg=C["hover"])
+        def on_leave(e): inner.config(bg=C["sidebar"])
+        for w in (f,inner)+inner.winfo_children():
+            w.bind("<Enter>",on_enter); w.bind("<Leave>",on_leave)
+            w.bind("<Button-1>", lambda e,c=cmd: c())
+
+    def _toggle_err(self, e=None):
+        if self._err_open:
+            self._err_frame.pack_forget(); self._etgl.config(text="▶  오류 로그")
+        else:
+            self._err_frame.pack(fill="x"); self._etgl.config(text="▼  오류 로그")
+        self._err_open = not self._err_open
+
+    def _set_status(self, msg, status="idle"):
+        self._sdot.set_status(status); self._stxt.config(text=msg)
+
+    # ── Handlers ──────────────────────────────
     def on_pick_folder(self):
-        folder = filedialog.askdirectory(title="PDF 폴더 선택")
-        if folder:
-            self.folder_var.set(folder)
+        f = filedialog.askdirectory(title="PDF 폴더 선택")
+        if f: self.folder_var.set(f)
 
     def on_manage_synonyms(self):
-        SynonymsDialog(self, self.db_path, on_changed_callback=self._load_synonyms)
+        SynonymsDialog(self, self.db_path, self._load_synonyms)
 
     def on_settings(self):
-        win = tk.Toplevel(self)
-        win.title("뷰어/LLM 설정")
-        win.geometry("820x420")
-        win.minsize(760, 380)
-
-        mode_var = tk.StringVar(value=(self.settings.get("viewer_mode") or ""))
-        path_var = tk.StringVar(value=(self.settings.get("viewer_path") or ""))
-        custom_args_var = tk.StringVar(value=json.dumps(self.settings.get("viewer_custom_args") or ["{viewer}", "{file}"], ensure_ascii=False))
-
-        llm_path_var = tk.StringVar(value=(self.settings.get("llm_model_path") or ""))
-        llm_ctx_var = tk.IntVar(value=int(self.settings.get("llm_ctx") or 2048))
-        llm_threads_var = tk.IntVar(value=int(self.settings.get("llm_threads") or max(1,(os.cpu_count() or 4)-1)))
-
-        frm = ttk.Frame(win, padding=12); frm.pack(fill="both", expand=True)
-
-        ttk.Label(frm, text="PDF 뷰어 모드:").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(frm, textvariable=mode_var, values=["", "sumatra", "acrobat", "custom"], state="readonly", width=14)\
-            .grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(frm, text="(빈값: Sumatra 자동 → 기본 열기)").grid(row=0, column=2, sticky="w")
-
-        ttk.Label(frm, text="뷰어 exe 경로:").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(frm, textvariable=path_var, width=76).grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=(10, 0))
-        def pick_exe():
-            p = filedialog.askopenfilename(title="뷰어 exe 선택", filetypes=[("EXE", "*.exe"), ("All", "*.*")])
-            if p: path_var.set(p)
-        ttk.Button(frm, text="찾기", command=pick_exe).grid(row=1, column=3, sticky="w", pady=(10, 0))
-
-        ttk.Label(frm, text="custom args(JSON list):").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(frm, textvariable=custom_args_var, width=76).grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=(10, 0))
-
-        ttk.Separator(frm).grid(row=3, column=0, columnspan=4, sticky="ew", pady=12)
-
-        ttk.Label(frm, text="LLM 모델(.gguf) 경로:").grid(row=4, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=llm_path_var, width=76).grid(row=4, column=1, columnspan=2, sticky="w", padx=6)
-        def pick_gguf():
-            p = filedialog.askopenfilename(title="GGUF 모델 선택", filetypes=[("GGUF", "*.gguf"), ("All", "*.*")])
-            if p: llm_path_var.set(p)
-        ttk.Button(frm, text="찾기", command=pick_gguf).grid(row=4, column=3, sticky="w")
-
-        ttk.Label(frm, text="컨텍스트(n_ctx):").grid(row=5, column=0, sticky="w", pady=(10, 0))
-        ttk.Spinbox(frm, from_=512, to=8192, textvariable=llm_ctx_var, width=8).grid(row=5, column=1, sticky="w", padx=6, pady=(10, 0))
-        ttk.Label(frm, text="스레드(n_threads):").grid(row=5, column=2, sticky="e", pady=(10, 0))
-        ttk.Spinbox(frm, from_=1, to=max(1, os.cpu_count() or 2), textvariable=llm_threads_var, width=8).grid(row=5, column=3, sticky="w", pady=(10, 0))
-
-        def save():
-            self.settings["viewer_mode"] = mode_var.get().strip()
-            self.settings["viewer_path"] = path_var.get().strip()
-            try:
-                args = json.loads(custom_args_var.get().strip())
-                if not isinstance(args, list):
-                    raise ValueError
-                self.settings["viewer_custom_args"] = args
-            except Exception:
-                messagebox.showwarning("형식 오류", "custom args는 JSON 배열이어야 합니다.")
-                return
-
-            self.settings["llm_model_path"] = llm_path_var.get().strip()
-            self.settings["llm_ctx"] = int(llm_ctx_var.get())
-            self.settings["llm_threads"] = int(llm_threads_var.get())
-            self._save_settings()
-            messagebox.showinfo("저장", "설정을 저장했습니다.")
-            win.destroy()
-
-        ttk.Button(frm, text="저장", command=save).grid(row=6, column=3, sticky="e", pady=(16, 0))
+        SettingsDialog(self, self.settings, self._save_settings)
 
     def on_start_index(self):
         folder = self.folder_var.get().strip()
         if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("폴더 필요", "유효한 폴더를 선택하세요.")
-            return
+            messagebox.showwarning("폴더 필요","유효한 폴더를 선택하세요."); return
         if self.indexer and self.indexer.is_alive():
-            messagebox.showinfo("이미 실행 중", "인덱싱이 이미 실행 중입니다.")
-            return
-
-        self.err_text.delete("1.0", "end")
-        self.progress_var.set(0)
-        self.status_var.set("스캔 중…")
-        self.cancel_event.clear()
-
+            messagebox.showinfo("실행 중","인덱싱이 이미 실행 중입니다."); return
+        self.err_text.delete("1.0","end")
+        self._prog.set(0); self.cancel_event.clear()
+        self._set_status("스캔 중…","running")
         self.indexer = IndexerThread(
-            db_path=self.db_path,
-            root_folder=folder,
-            event_queue=self.event_q,
-            cancel_event=self.cancel_event,
+            db_path=self.db_path, root_folder=folder,
+            event_queue=self.event_q, cancel_event=self.cancel_event,
             build_ngram=self.build_ngram_var.get(),
             parallel=self.parallel_var.get(),
             max_workers=int(self.workers_var.get()),
             build_summary=self.build_summary_var.get(),
-            llm_model_path=str(self.settings.get("llm_model_path") or ""),
-            llm_ctx=int(self.settings.get("llm_ctx") or 2048),
-            llm_threads=int(self.settings.get("llm_threads") or max(1,(os.cpu_count() or 4)-1)),
+            llm_model_path=str(self.settings.get("llm_model_path","")),
+            llm_ctx=int(self.settings.get("llm_ctx",2048)),
+            llm_threads=int(self.settings.get("llm_threads",max(1,(os.cpu_count() or 4)-1))),
         )
         self.indexer.start()
 
     def on_cancel_index(self):
         if self.indexer and self.indexer.is_alive():
-            self.cancel_event.set()
-            self.status_var.set("취소 요청됨…")
+            self.cancel_event.set(); self._set_status("취소 요청됨…","running")
         else:
-            self.status_var.set("실행 중 인덱싱 없음")
+            self._set_status("실행 중인 인덱싱이 없습니다.","idle")
 
     def on_search(self):
-        user_q = self.query_var.get().strip()
-        if not user_q:
-            messagebox.showinfo("검색어 없음", "검색어를 입력하세요.")
-            return
-
+        user_q = self._sbar.get().strip()
+        if not user_q: messagebox.showinfo("검색어 없음","검색어를 입력하세요."); return
         try:
             db = IndexDB(self.db_path)
             fts_q = make_fts_query(user_q, self.expand_var.get(), self.syn_graph)
-
-            merged: Dict[Tuple[str, int, str], Tuple[str, float]] = {}
+            merged: Dict[Tuple[str,int,str],Tuple[str,float]] = {}
 
             if fts_q:
-                rows = db.search_pages_text(fts_q, limit=250)
-                for r in rows:
-                    merged[(r["path"], int(r["page_no"]), "page")] = (r["snippet"] or "", float(r["score"]))
+                for r in db.search_pages_text(fts_q,250):
+                    merged[(r["path"],int(r["page_no"]),"page")] = (r["snippet"] or "",float(r["score"]))
 
             if self.ngram_search_var.get():
                 ng_q = make_ngram_query(user_q, self.expand_var.get(), self.syn_graph)
                 if ng_q:
-                    rows = db.search_pages_ngram(ng_q, limit=250)
-                    for r in rows:
-                        key = (r["path"], int(r["page_no"]), "ng")
+                    for r in db.search_pages_ngram(ng_q,250):
+                        key = (r["path"],int(r["page_no"]),"ng")
                         if key not in merged:
-                            merged[key] = (r["snippet"] or "", float(r["score"]) + 2.0)
+                            merged[key] = (r["snippet"] or "",float(r["score"])+2.0)
 
             if self.summary_search_var.get() and fts_q:
-                rows = db.search_doc_summaries(fts_q, limit=200)
-                for r in rows:
-                    key = (r["path"], 1, "summary")
+                for r in db.search_doc_summaries(fts_q,200):
+                    key = (r["path"],1,"summary")
                     if key not in merged:
-                        merged[key] = (r["snippet"] or "", float(r["score"]) + 1.0)
+                        merged[key] = (r["snippet"] or "",float(r["score"])+1.0)
 
             db.close()
+            top = nsmallest(600, merged.items(), key=lambda kv: kv[1][1])
+            for it in self.tree.get_children(): self.tree.delete(it)
+            self._result_map = {}
+            src_icon = {"page":"📄","ng":"🔤","summary":"📝"}
+            for i,((path,page,src),(snip,_)) in enumerate(top):
+                tag = "odd" if i%2==0 else "even"
+                fname = os.path.basename(path)
+                disp  = fname + "   " + os.path.dirname(path)
+                iid   = self.tree.insert("","end",
+                                          values=(disp, page, snip, src_icon.get(src,"📄")),
+                                          tags=(tag,))
+                self._result_map[iid] = (path, page)
 
-            # nsmallest: 전체 정렬 없이 top-600만 추출 (O(n log k) vs O(n log n))
-            top_items = nsmallest(600, merged.items(), key=lambda kv: kv[1][1])
-
-            for it in self.tree.get_children():
-                self.tree.delete(it)
-            for (path, page, src), (snip, _sc) in top_items:
-                self.tree.insert("", "end", values=(path, page, snip, src))
-
-            self.status_var.set(f"검색 완료: {len(merged)}건 | 쿼리: {fts_q}")
-
+            self._rcnt.config(text=f"{len(merged):,}건 검색됨")
+            self._set_status(f"검색 완료 — {len(merged):,}건","ok")
         except Exception as e:
-            messagebox.showerror("검색 실패", str(e))
+            messagebox.showerror("검색 실패",str(e))
 
     def on_open_selected(self, _evt=None):
         sel = self.tree.selection()
-        if not sel:
-            return
-        vals = self.tree.item(sel[0], "values")
-        if not vals:
-            return
-        path = vals[0]
-        page = int(vals[1]) if len(vals) > 1 else 1
-        try:
-            open_pdf_at_page(path, page, self.settings)
-        except Exception as e:
-            messagebox.showerror("열기 실패", str(e))
+        if not sel: return
+        path,page = self._result_map.get(sel[0],(None,1))
+        if not path: return
+        try: open_pdf_at_page(path,page,self.settings)
+        except Exception as e: messagebox.showerror("열기 실패",str(e))
 
+    # ── Event polling ─────────────────────────
     def _poll_events(self):
         try:
             while True:
                 typ, payload = self.event_q.get_nowait()
                 if typ == "scan":
-                    total = int(payload)
-                    self.progress_var.set(0)
-                    self.status_var.set(f"PDF 스캔 완료. 총 {total}개")
+                    self._prog.set(0); self._set_status(f"스캔 완료. 총 {payload}개","running")
                 elif typ == "plan":
-                    changed, total = payload
-                    self.status_var.set(f"변경/신규 {changed}개 / 총 {total}개 처리 중…")
+                    c,t = payload; self._set_status(f"변경 {c}개 / 총 {t}개 처리 중…","running")
                 elif typ == "parallel":
-                    self.status_var.set(f"병렬 추출 모드: workers={payload}")
+                    self._set_status(f"병렬 추출 (workers={payload})","running")
                 elif typ == "llm":
-                    self.status_var.set(str(payload))
+                    self._set_status(str(payload),"running")
                 elif typ == "progress":
-                    p: IndexProgress = payload
-                    self.progress_var.set((p.current / max(1, p.total)) * 100.0)
-                    self.status_var.set(f"[{p.current}/{p.total}] 인덱싱: {p.path}")
+                    p = payload
+                    self._prog.set((p.current/max(1,p.total))*100)
+                    self._set_status(f"[{p.current}/{p.total}]  {os.path.basename(p.path)}","running")
                 elif typ == "extract_done":
-                    done, total_changed, path = payload
-                    self.progress_var.set((done / max(1, total_changed)) * 100.0)
-                    self.status_var.set(f"[{done}/{total_changed}] 추출완료→DB/요약: {path}")
+                    d,t,path = payload
+                    self._prog.set((d/max(1,t))*100)
+                    self._set_status(f"[{d}/{t}]  {os.path.basename(path)}","running")
                 elif typ == "deleted":
-                    self.status_var.set(f"삭제/이동 반영: {payload}")
+                    self._set_status(f"삭제 반영: {os.path.basename(payload)}","running")
                 elif typ == "error":
-                    err: IndexErrorItem = payload
-                    self.err_text.insert("end", f"- {err.path}\n  {err.error}\n")
+                    err = payload
+                    if not self._err_open: self._toggle_err()
+                    self.err_text.insert("end",f"✕  {err.path}\n   {err.error}\n\n")
                     self.err_text.see("end")
                 elif typ == "errors_done":
-                    errs = payload
-                    self.progress_var.set(100.0)
-                    self.status_var.set(f"인덱싱 완료(오류 {len(errs)}건)" if errs else "인덱싱 완료(오류 없음)")
+                    errs = payload; self._prog.set(100)
+                    self._set_status(f"완료 (오류 {len(errs)}건)","error") if errs \
+                        else self._set_status("인덱싱 완료","ok")
                 elif typ == "canceled":
-                    self.status_var.set("인덱싱 취소됨")
+                    self._prog.set(0); self._set_status("인덱싱 취소됨","idle")
                 elif typ == "done":
-                    self.status_var.set("인덱싱 완료. 검색 가능.")
-                    self.progress_var.set(100.0)
+                    self._prog.set(100); self._set_status("인덱싱 완료. 검색 가능.","ok")
                 elif typ == "fatal":
-                    messagebox.showerror("치명적 오류", str(payload))
-                    self.status_var.set("오류로 중단됨")
+                    messagebox.showerror("치명적 오류",str(payload))
+                    self._set_status("오류로 중단됨","error")
         except queue.Empty:
             pass
         finally:
             self.after(120, self._poll_events)
 
+
 def main():
     if fitz is None:
         print("PyMuPDF가 필요합니다: pip install pymupdf")
-    app = App()
-    app.mainloop()
+    app = App(); app.mainloop()
 
 if __name__ == "__main__":
     main()
