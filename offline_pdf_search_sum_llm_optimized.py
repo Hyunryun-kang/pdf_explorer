@@ -173,19 +173,52 @@ def open_pdf_at_page(path, page_no_1base, settings):
     open_file_default(path)
 
 def llm_summarize(llm, text, max_chars_in=60_000, max_tokens_out=220):
+    """
+    create_chat_completion() 사용 — Instruct/Chat 모델 (Qwen2.5, EXAONE, Gemma 등)
+    에서 chat template이 자동 적용되어 올바른 출력이 나옵니다.
+    """
     t = normalize_ws(text)
     if not t: return ""
     if len(t) > max_chars_in: t = t[:max_chars_in]
-    prompt = (
-        "다음 문서를 한국어로 간결하게 요약해라.\n"
-        "- 핵심 주제 1~2문장\n- 주요 포인트 3~6개를 문장으로\n"
-        "- 과장/추측 금지, 문서에 있는 내용만\n\n"
-        f"문서:\n{t}\n\n요약:\n"
+
+    system_msg = (
+        "당신은 문서 요약 전문가입니다. "
+        "주어진 문서를 한국어로 간결하고 정확하게 요약합니다. "
+        "문서에 없는 내용은 절대 추가하지 않습니다."
     )
-    out = llm(prompt, max_tokens=max_tokens_out, temperature=0.2,
-              top_p=0.9, repeat_penalty=1.1, stop=["\n\n\n"])
-    try:    txt = out["choices"][0]["text"]
-    except: txt = str(out)
+    user_msg = (
+        "다음 문서를 한국어로 요약해주세요.\n\n"
+        "요약 형식:\n"
+        "- 핵심 주제: 1~2문장\n"
+        "- 주요 내용: 3~6개 항목을 간결한 문장으로\n\n"
+        f"문서:\n{t}"
+    )
+
+    try:
+        out = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=max_tokens_out,
+            temperature=0.2,
+            top_p=0.9,
+            repeat_penalty=1.1,
+        )
+        txt = out["choices"][0]["message"]["content"]
+    except Exception:
+        # create_chat_completion 미지원 모델 fallback (구형 base 모델 등)
+        fallback_prompt = (
+            f"{system_msg}\n\n"
+            f"문서:\n{t}\n\n"
+            "요약:\n"
+        )
+        out2 = llm(fallback_prompt, max_tokens=max_tokens_out,
+                   temperature=0.2, top_p=0.9, repeat_penalty=1.1,
+                   stop=["\n\n\n"])
+        try:    txt = out2["choices"][0]["text"]
+        except: txt = str(out2)
+
     return normalize_ws(txt)
 
 # ── DB ────────────────────────────────────────
