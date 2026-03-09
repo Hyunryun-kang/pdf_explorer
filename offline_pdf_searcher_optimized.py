@@ -94,8 +94,8 @@ C = {
     "yellow_bg":    "#2a2110",
 }
 
-SANS = ("Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", "sans-serif")
-MONO = ("JetBrains Mono", "Fira Code", "Consolas", "Courier New", "monospace")
+SANS = ("맑은 고딕", "Malgun Gothic", "Apple SD Gothic Neo", "Pretendard", "Segoe UI", "sans-serif")
+MONO = ("Consolas", "JetBrains Mono", "Fira Code", "Courier New", "monospace")
 
 def pfont(families, size=12, weight="normal"):
     avail = tkfont.families()
@@ -314,7 +314,7 @@ class IndexDB:
     def search_text(self, fts_query, limit=250):
         cur = self._conn.cursor()
         cur.execute("""SELECT d.path,p.page_no,
-            snippet(pages_fts,0,'[',']',' … ',12) AS snippet, bm25(pages_fts) AS score
+            snippet(pages_fts,0,'[',']',' … ',80) AS snippet, bm25(pages_fts) AS score
             FROM pages_fts JOIN pages p ON p.page_id=pages_fts.rowid
             JOIN documents d ON d.doc_id=p.doc_id
             WHERE pages_fts MATCH ? ORDER BY score LIMIT ?""",(fts_query,limit))
@@ -323,7 +323,7 @@ class IndexDB:
     def search_ngram(self, grams_query, limit=250):
         cur = self._conn.cursor()
         cur.execute("""SELECT d.path,p.page_no,
-            snippet(pages_ng_fts,0,'[',']',' … ',12) AS snippet, bm25(pages_ng_fts) AS score
+            snippet(pages_ng_fts,0,'[',']',' … ',80) AS snippet, bm25(pages_ng_fts) AS score
             FROM pages_ng_fts JOIN pages p ON p.page_id=pages_ng_fts.rowid
             JOIN documents d ON d.doc_id=p.doc_id
             WHERE pages_ng_fts MATCH ? ORDER BY score LIMIT ?""",(grams_query,limit))
@@ -520,12 +520,18 @@ class FlatButton(tk.Canvas):
         self._cmd  = command
         fnt = pfont(SANS, fs, "bold" if accent else "normal")
 
-        tmp = tk.Label(parent, text=text, font=fnt)
-        tw, th = tmp.winfo_reqwidth(), tmp.winfo_reqheight(); tmp.destroy()
-        w, h = tw + px*2, th + py*2
-        super().__init__(parent, width=w, height=h,
+        # super().__init__ 을 먼저 호출해 Canvas(Tk 위젯)를 확정한 뒤
+        # tkfont.Font 를 생성해야 "invalid command name" 에러를 피할 수 있음
+        super().__init__(parent, width=1, height=1,
                          bg=C["bg"], highlightthickness=0, **kw)
-        self._w, self._h, self._fnt = w, h, fnt
+        self._fnt = fnt
+        _fobj = tkfont.Font(family=fnt[0], size=fnt[1],
+                            weight=fnt[2] if len(fnt) > 2 else "normal")
+        tw = _fobj.measure(text)
+        th = _fobj.metrics("linespace")
+        w, h = tw + px*2, th + py*2
+        self.config(width=w, height=h)
+        self._btn_w, self._btn_h = w, h
         self._r = h // 2
         self._draw(self._bg)
         self.bind("<Enter>",          lambda e: self._draw(self._hbg))
@@ -535,7 +541,7 @@ class FlatButton(tk.Canvas):
 
     def _draw(self, color):
         self.delete("all")
-        r, w, h = self._r, self._w, self._h
+        r, w, h = self._r, self._btn_w, self._btn_h
         self.create_arc(0,0,r*2,h,   start=90,  extent=180, fill=color, outline="")
         self.create_arc(w-r*2,0,w,h, start=270, extent=180, fill=color, outline="")
         self.create_rectangle(r,0,w-r,h, fill=color, outline="")
@@ -853,6 +859,144 @@ class ViewerSettingsDialog(tk.Toplevel):
         self.destroy()
 
 # ══════════════════════════════════════════════
+#  ResultList  —  멀티라인 미리보기 카드 리스트
+# ══════════════════════════════════════════════
+class ResultCard(tk.Frame):
+    """파일명 헤더 + 멀티라인 스니펫 카드 한 장."""
+    def __init__(self, parent, idx: int, disp_path: str, page: int,
+                 snippet: str, on_open, **kw):
+        bg = C["panel"] if idx % 2 == 0 else C["panel2"]
+        super().__init__(parent, bg=bg, cursor="hand2", **kw)
+        self._on_open = on_open
+        self._bg = bg
+        self._hbg = C["hover"]
+
+        # ── 헤더 행 ──
+        hdr = tk.Frame(self, bg=bg, padx=14, pady=8)
+        hdr.pack(fill="x")
+
+        # 파일명 (굵게)
+        fname = disp_path.split("   ")[0] if "   " in disp_path else disp_path
+        fdir  = disp_path.split("   ")[1] if "   " in disp_path else ""
+        tk.Label(hdr, text=fname, bg=bg, fg=C["text"],
+                 font=pfont(SANS, 11, "bold"), anchor="w")            .pack(side="left")
+        if fdir:
+            tk.Label(hdr, text=f"  {fdir}", bg=bg, fg=C["text3"],
+                     font=pfont(SANS, 9), anchor="w")                .pack(side="left")
+
+        # 페이지 배지
+        pg_c = tk.Canvas(hdr, width=52, height=20, bg=bg, highlightthickness=0)
+        pg_c.pack(side="right")
+        pg_c.create_arc(0,0,20,20,  start=90, extent=180, fill=C["accent_dim"], outline="")
+        pg_c.create_arc(32,0,52,20, start=270,extent=180, fill=C["accent_dim"], outline="")
+        pg_c.create_rectangle(10,0,42,20, fill=C["accent_dim"], outline="")
+        pg_c.create_text(26,10, text=f"p.{page}", fill=C["accent_text"],
+                         font=pfont(SANS,9))
+
+        # ── 구분선 ──
+        tk.Frame(self, bg=C["border_soft"], height=1).pack(fill="x", padx=14)
+
+        # ── 스니펫 텍스트 ──
+        txt = snippet.replace(" … ", "\n… ").strip()
+        snip_lbl = tk.Label(self, text=txt, bg=bg, fg=C["text2"],
+                            font=pfont(SANS, 10),
+                            justify="left", anchor="nw",
+                            wraplength=0,   # 동적으로 설정
+                            padx=14, pady=8)
+        snip_lbl.pack(fill="x", expand=False)
+        self._snip_lbl = snip_lbl
+
+        # ── 하단 여백선 ──
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x")
+
+        # 호버 & 클릭 바인딩 — 모든 자식에도 적용
+        self._bind_all()
+
+    def _bind_all(self):
+        def enter(e):
+            for w in self.winfo_children() + [self]:
+                try: w.config(bg=self._hbg)
+                except: pass
+        def leave(e):
+            for w in self.winfo_children() + [self]:
+                try: w.config(bg=self._bg)
+                except: pass
+        def click(e): self._on_open()
+
+        for w in [self] + list(self.winfo_children()):
+            w.bind("<Enter>",    enter)
+            w.bind("<Leave>",    leave)
+            w.bind("<Double-1>", click)
+            for ww in w.winfo_children():
+                ww.bind("<Enter>",    enter)
+                ww.bind("<Leave>",    leave)
+                ww.bind("<Double-1>", click)
+
+    def set_wrap(self, width: int):
+        self._snip_lbl.config(wraplength=max(200, width - 28))
+
+
+class ResultList(tk.Frame):
+    """Canvas + Scrollbar 기반 가상 스크롤 카드 리스트."""
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=C["bg"], **kw)
+        self._cards: List[Tuple[ResultCard, callable]] = []  # (card, open_fn)
+
+        self._canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0,
+                                  yscrollcommand=self._on_yscroll)
+        self._vsb    = ttk.Scrollbar(self, orient="vertical",
+                                      command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+
+        self._vsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        self._inner = tk.Frame(self._canvas, bg=C["bg"])
+        self._win_id = self._canvas.create_window((0,0), window=self._inner,
+                                                   anchor="nw")
+        self._inner.bind("<Configure>", self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        # 마우스 휠
+        self._canvas.bind("<MouseWheel>",       self._on_wheel)
+        self._canvas.bind("<Button-4>",         self._on_wheel)
+        self._canvas.bind("<Button-5>",         self._on_wheel)
+        self._inner.bind("<MouseWheel>",        self._on_wheel)
+
+    def _on_yscroll(self, *args):
+        pass  # yscrollcommand callback (not used directly)
+
+    def _on_inner_configure(self, e=None):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, e=None):
+        w = self._canvas.winfo_width()
+        self._canvas.itemconfig(self._win_id, width=w)
+        for card, _ in self._cards:
+            card.set_wrap(w)
+
+    def _on_wheel(self, e):
+        if e.num == 4:   delta = -1
+        elif e.num == 5: delta =  1
+        else:            delta = -1 * (e.delta // 120)
+        self._canvas.yview_scroll(delta, "units")
+
+    def clear(self):
+        for card, _ in self._cards:
+            card.destroy()
+        self._cards.clear()
+
+    def add_card(self, idx, disp_path, page, snippet, open_fn):
+        card = ResultCard(self._inner, idx, disp_path, page, snippet, open_fn)
+        card.pack(fill="x")
+        self._cards.append((card, open_fn))
+        # 휠 바인딩을 새 카드에도
+        card.bind("<MouseWheel>", self._on_wheel)
+
+    def get_children_count(self):
+        return len(self._cards)
+
+
+# ══════════════════════════════════════════════
 #  Main Application Window
 # ══════════════════════════════════════════════
 class App(tk.Tk):
@@ -869,7 +1013,8 @@ class App(tk.Tk):
         self.indexer: Optional[IndexerThread] = None
         self.syn_graph: Dict[str,Set[str]] = {}
         self.settings     = self._load_settings()
-        self._result_map: Dict[str,Tuple[str,int]] = {}
+        self._result_map: Dict[str,Tuple[str,int]] = {}   # 현재 표시 중인 결과
+        self._full_result_map: Dict[str,Tuple[str,int]] = {}  # 누적 전체 결과 (재검색 베이스)
 
         self._setup_ttk_styles()
         self._build_ui()
@@ -1013,6 +1158,26 @@ class App(tk.Tk):
                           ("N-gram 검색", self.ngram_search_var)]:
             t = Toggle(fr, txt, var); t.pack(side="left", padx=(0,20))
 
+        # ── 결과 내 재검색 바 ──
+        rb = tk.Frame(tb, bg=C["panel2"],
+                      highlightbackground=C["border"], highlightthickness=1)
+        rb.pack(fill="x", pady=(10,0))
+        # 왼쪽: 아이콘 + 레이블
+        tk.Label(rb, text="⊂", bg=C["panel2"], fg=C["text3"],
+                 font=pfont(SANS,12)).pack(side="left", padx=(10,4), pady=6)
+        tk.Label(rb, text="결과 내 재검색", bg=C["panel2"], fg=C["text3"],
+                 font=pfont(SANS,10)).pack(side="left", pady=6)
+        # 오른쪽: 초기화 버튼
+        FlatButton(rb, "초기화", self.on_reset_filter, small=True)            .pack(side="right", padx=(4,8), pady=4)
+        FlatButton(rb, "적용", self.on_filter_results, accent=True, small=True)            .pack(side="right", padx=(0,4), pady=4)
+        # 입력창
+        self.filter_var = tk.StringVar()
+        fe = tk.Entry(rb, textvariable=self.filter_var, bd=0, relief="flat",
+                      bg=C["panel2"], fg=C["text"],
+                      insertbackground=C["accent"], font=pfont(SANS,11))
+        fe.pack(side="left", fill="x", expand=True, ipady=6, padx=(8,4))
+        fe.bind("<Return>", lambda e: self.on_filter_results())
+
         # progress strip
         self._prog = ProgressStrip(main); self._prog.pack(fill="x")
 
@@ -1026,26 +1191,9 @@ class App(tk.Tk):
                                fg=C["text3"], font=pfont(SANS,10))
         self._rcnt.pack(side="right")
 
-        # results tree
-        rf = tk.Frame(main, bg=C["bg"]); rf.pack(fill="both", expand=True)
-        cols = ("path","page","snippet")
-        self.tree = ttk.Treeview(rf, columns=cols, show="headings", style="R.Treeview")
-        self.tree.heading("path",    text="파일 경로")
-        self.tree.heading("page",    text="페이지")
-        self.tree.heading("snippet", text="미리보기")
-        self.tree.column("path",    width=480, anchor="w")
-        self.tree.column("page",    width=66,  anchor="center")
-        self.tree.column("snippet", width=560, anchor="w")
-        vsb = ttk.Scrollbar(rf, orient="vertical",   command=self.tree.yview)
-        hsb = ttk.Scrollbar(rf, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0,column=0,sticky="nsew")
-        vsb.grid(row=0,column=1,sticky="ns")
-        hsb.grid(row=1,column=0,sticky="ew")
-        rf.grid_rowconfigure(0,weight=1); rf.grid_columnconfigure(0,weight=1)
-        self.tree.tag_configure("odd",  background=C["panel"])
-        self.tree.tag_configure("even", background=C["panel2"])
-        self.tree.bind("<Double-1>", self.on_open_selected)
+        # results list (멀티라인 카드)
+        self.result_list = ResultList(main)
+        self.result_list.pack(fill="both", expand=True)
 
         # error panel (collapsible)
         self._err_open = False
@@ -1069,7 +1217,7 @@ class App(tk.Tk):
                  font=pfont(SANS,11)).pack(side="left")
         def on_enter(e): inner.config(bg=C["hover"])
         def on_leave(e): inner.config(bg=C["sidebar"])
-        for w in (f, inner) + inner.winfo_children():
+        for w in (f, inner) + tuple(inner.winfo_children()):
             w.bind("<Enter>", on_enter); w.bind("<Leave>", on_leave)
             w.bind("<Button-1>", lambda e, c=cmd: c())
 
@@ -1141,27 +1289,58 @@ class App(tk.Tk):
                     merged[key] = (r["snippet"] or "", float(r["score"])+2.0)
 
             top = nsmallest(500, merged.items(), key=lambda kv: kv[1][1])
-            for it in self.tree.get_children(): self.tree.delete(it)
-            self._result_map = {}
-            for i, ((path, page), (snip, _)) in enumerate(top):
-                tag = "odd" if i%2==0 else "even"
+
+            # 전체 결과를 (disp_path, page, snip, path) 리스트로 보존
+            self._full_results: List[Tuple[str,int,str,str]] = []
+            for (path, page), (snip, _) in top:
                 fname = os.path.basename(path)
                 disp_path = fname + "   " + os.path.dirname(path)
-                iid = self.tree.insert("","end", values=(disp_path, page, snip), tags=(tag,))
-                self._result_map[iid] = (path, page)
+                self._full_results.append((disp_path, page, snip, path))
 
+            self._render_results(self._full_results)
+            self.filter_var.set("")   # 재검색창 초기화
             self._rcnt.config(text=f"{len(merged):,}건 검색됨")
             self._set_status(f"검색 완료 — {len(merged):,}건", "ok")
         except Exception as e:
             messagebox.showerror("검색 실패",str(e))
 
+    def _render_results(self, results: List[Tuple[str,int,str,str]]):
+        """(disp_path, page, snip, real_path) 리스트를 카드 리스트에 표시."""
+        self.result_list.clear()
+        self._result_map = {}
+        for i, (disp_path, page, snip, real_path) in enumerate(results):
+            # 클로저 캡처를 위해 기본인자 패턴 사용
+            def make_open(p=real_path, pg=page):
+                try: open_pdf_at_page(p, pg, self.settings)
+                except Exception as e: messagebox.showerror("열기 실패", str(e))
+            self.result_list.add_card(i, disp_path, page, snip, make_open)
+
+    def on_filter_results(self):
+        """현재 검색 결과(_full_results) 안에서 키워드로 재필터링. 횟수 제한 없음."""
+        kw = self.filter_var.get().strip().lower()
+        if not hasattr(self, '_full_results') or not self._full_results:
+            self._set_status("먼저 검색을 실행하세요.", "idle"); return
+        if not kw:
+            self._render_results(self._full_results)
+            self._rcnt.config(text=f"{len(self._full_results):,}건 (전체)")
+            return
+        filtered = [r for r in self._full_results
+                    if kw in r[0].lower() or kw in r[2].lower()]
+        self._render_results(filtered)
+        self._rcnt.config(text=f"{len(filtered):,} / {len(self._full_results):,}건")
+        self._set_status(f"재검색 완료 — '{kw}'  {len(filtered):,}건", "ok")
+
+    def on_reset_filter(self):
+        """재검색 초기화 — 원래 전체 결과로 복원."""
+        self.filter_var.set("")
+        if not hasattr(self, '_full_results') or not self._full_results: return
+        self._render_results(self._full_results)
+        self._rcnt.config(text=f"{len(self._full_results):,}건 (전체)")
+        self._set_status(f"검색 결과 초기화됨 — {len(self._full_results):,}건", "ok")
+
     def on_open_selected(self, _evt=None):
-        sel = self.tree.selection()
-        if not sel: return
-        path, page = self._result_map.get(sel[0], (None,1))
-        if not path: return
-        try: open_pdf_at_page(path, page, self.settings)
-        except Exception as e: messagebox.showerror("열기 실패",str(e))
+        # 카드 더블클릭으로 직접 열리므로 여기서는 사용 안 함 (호환성 유지)
+        pass
 
     # ── Event polling ─────────────────────────
     def _poll_events(self):

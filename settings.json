@@ -1,8 +1,11 @@
 {
-  "viewer_mode": "",
+  "viewer_mode": "acrobat",
   "viewer_path": "",
   "viewer_custom_args": [
     "{viewer}",
     "{file}"
-  ]
+  ],
+  "llm_model_path": "",
+  "llm_ctx": 2048,
+  "llm_threads": 11
 }
