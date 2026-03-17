@@ -15,7 +15,7 @@ import traceback
 import subprocess
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from heapq import nsmallest
 from typing import Dict, List, Set, Tuple, Optional
 
@@ -149,6 +149,27 @@ def find_sumatra_exe():
     for c in candidates:
         if c and os.path.exists(c): return c
     return shutil.which("SumatraPDF.exe") or shutil.which("SumatraPDF")
+
+def extract_date_from_filename(fname: str):
+    """
+    파일명에서 날짜 추출.
+    예) 내가사는삶_2021.09.21(구역공과).pdf → date(2021, 9, 21)
+    반환: datetime.date 또는 None
+    """
+    patterns = [
+        r'((?:19|20)\d{2})[.\-_](\d{1,2})[.\-_](\d{1,2})',
+        r'((?:19|20)\d{2})(\d{2})(\d{2})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, fname)
+        if m:
+            try:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                return date(y, mo, d)
+            except ValueError:
+                continue
+    return None
+
 
 def open_file_default(path):
     try: os.startfile(path)
@@ -1007,7 +1028,7 @@ class SettingsDialog(tk.Toplevel):
 # ══════════════════════════════════════════════
 class ResultCard(tk.Frame):
     """파일명 헤더 + 멀티라인 스니펫 카드 한 장."""
-    def __init__(self, parent, idx, disp_path, page, snippet, src_icon, on_open, **kw):
+    def __init__(self, parent, idx, disp_path, page, snippet, src_icon, on_open, fdate=None, **kw):
         bg = C["panel"] if idx % 2 == 0 else C["panel2"]
         super().__init__(parent, bg=bg, cursor="hand2", **kw)
         self._on_open = on_open
@@ -1036,6 +1057,18 @@ class ResultCard(tk.Frame):
         pg_c.create_rectangle(10,0,62,20, fill=sc_bg, outline="")
         pg_c.create_text(36,10, text=f"{src_icon} p.{page}",
                          fill=sc_fg, font=pfont(SANS,9))
+
+        # 날짜 배지
+        if fdate is not None:
+            date_str = fdate.strftime("%Y.%m.%d")
+            dw = 80
+            dbg = C["panel2"] if idx%2==0 else C["border"]
+            d_c = tk.Canvas(hdr, width=dw, height=20, bg=bg, highlightthickness=0)
+            d_c.pack(side="right", padx=(0,6))
+            d_c.create_arc(0,0,20,20,     start=90,  extent=180, fill=dbg, outline="")
+            d_c.create_arc(dw-20,0,dw,20, start=270, extent=180, fill=dbg, outline="")
+            d_c.create_rectangle(10,0,dw-10,20, fill=dbg, outline="")
+            d_c.create_text(dw//2, 10, text=date_str, fill=C["text2"], font=pfont(SANS,9))
 
         tk.Frame(self, bg=C["border_soft"], height=1).pack(fill="x", padx=14)
 
@@ -1108,8 +1141,8 @@ class ResultList(tk.Frame):
         for card in self._cards: card.destroy()
         self._cards.clear()
 
-    def add_card(self, idx, disp_path, page, snippet, src_icon, open_fn):
-        card = ResultCard(self._inner, idx, disp_path, page, snippet, src_icon, open_fn)
+    def add_card(self, idx, disp_path, page, snippet, src_icon, open_fn, fdate=None):
+        card = ResultCard(self._inner, idx, disp_path, page, snippet, src_icon, open_fn, fdate=fdate)
         card.pack(fill="x")
         card.bind("<MouseWheel>", self._on_wheel)
         self._cards.append(card)
@@ -1134,6 +1167,9 @@ class App(tk.Tk):
         self.settings     = self._load_settings()
         self._result_map: Dict[str,Tuple[str,int]] = {}   # 현재 표시 중인 결과
         self._full_result_map: Dict[str,Tuple[str,int]] = {}  # 누적 전체 결과 (재검색 베이스)
+        self._full_results = []        # [(disp_path, page, snip, real_path, src_icon, file_date), ...]
+        self._sort_mode = "relevance"  # "relevance" | "newest" | "oldest"
+        self.corona_var = tk.BooleanVar(value=False)  # 코로나 기간(2020.03~) 우선
 
         self._setup_ttk_styles()
         self._build_ui()
@@ -1283,6 +1319,9 @@ class App(tk.Tk):
                           ("N-gram 검색", self.ngram_search_var),
                           ("요약 검색",   self.summary_search_var)]:
             t = Toggle(fr, txt, var); t.pack(side="left", padx=(0,20))
+        # 코로나 기간 우선 토글
+        Toggle(fr, "🦠 코로나 기간부터 보여주기", self.corona_var)\
+            .pack(side="left", padx=(0,20))
 
         # ── 결과 내 재검색 바 ──
         rb = tk.Frame(tb, bg=C["panel2"],
@@ -1301,7 +1340,42 @@ class App(tk.Tk):
         fe.pack(side="left", fill="x", expand=True, ipady=6, padx=(8,4))
         fe.bind("<Return>", lambda e: self.on_filter_results())
 
-        self._prog = ProgressStrip(main); self._prog.pack(fill="x")
+        # ── 정렬 바 ──
+        sb2 = tk.Frame(tb, bg=C["panel"]); sb2.pack(fill="x", pady=(10,0))
+        tk.Label(sb2, text="정렬:", bg=C["panel"], fg=C["text3"],
+                 font=pfont(SANS,10)).pack(side="left", padx=(0,8))
+        self._sort_btns = {}
+        for key, label in [("relevance","관련도순"), ("newest","최신순"), ("oldest","오래된순")]:
+            btn = FlatButton(sb2, label, lambda k=key: self._apply_sort(k), small=True)
+            btn.pack(side="left", padx=(0,4))
+            self._sort_btns[key] = btn
+
+        # ── 날짜 범위 필터 바 ──
+        db2 = tk.Frame(tb, bg=C["panel2"],
+                       highlightbackground=C["border"], highlightthickness=1)
+        db2.pack(fill="x", pady=(8,0))
+        tk.Label(db2, text="📅", bg=C["panel2"], fg=C["text3"],
+                 font=pfont(SANS,12)).pack(side="left", padx=(10,4), pady=6)
+        tk.Label(db2, text="날짜 필터", bg=C["panel2"], fg=C["text3"],
+                 font=pfont(SANS,10)).pack(side="left", pady=6)
+        FlatButton(db2, "초기화", self.on_reset_date_filter, small=True)\
+            .pack(side="right", padx=(4,8), pady=4)
+        FlatButton(db2, "적용", self.on_apply_date_filter, accent=True, small=True)\
+            .pack(side="right", padx=(0,4), pady=4)
+        self._date_to_var   = tk.StringVar()
+        self._date_from_var = tk.StringVar()
+        tk.Label(db2, text="~", bg=C["panel2"], fg=C["text2"],
+                 font=pfont(SANS,11)).pack(side="right", padx=4, pady=6)
+        tk.Entry(db2, textvariable=self._date_to_var, width=12, bd=0, relief="flat",
+                 bg=C["panel2"], fg=C["text"], insertbackground=C["accent"],
+                 font=pfont(SANS,11)).pack(side="right", ipady=6)
+        tk.Label(db2, text="종료", bg=C["panel2"], fg=C["text3"],
+                 font=pfont(SANS,9)).pack(side="right", padx=(8,2), pady=6)
+        tk.Entry(db2, textvariable=self._date_from_var, width=12, bd=0, relief="flat",
+                 bg=C["panel2"], fg=C["text"], insertbackground=C["accent"],
+                 font=pfont(SANS,11)).pack(side="right", ipady=6)
+        tk.Label(db2, text="시작", bg=C["panel2"], fg=C["text3"],
+                 font=pfont(SANS,9)).pack(side="right", padx=(12,2), pady=6)
 
         stbar = tk.Frame(main, bg=C["panel"], padx=18, pady=7); stbar.pack(fill="x")
         self._sdot = StatusDot(stbar); self._sdot.pack(side="left")
@@ -1419,13 +1493,14 @@ class App(tk.Tk):
             top = nsmallest(600, merged.items(), key=lambda kv: kv[1][1])
 
             src_icon = {"page":"📄","ng":"🔤","summary":"📝"}
-            self._full_results: List[Tuple[str,int,str,str,str]] = []
+            self._full_results = []
             for (path,page,src),(snip,_) in top:
                 fname = os.path.basename(path)
                 disp  = fname + "   " + os.path.dirname(path)
-                self._full_results.append((disp, page, snip, path, src_icon.get(src,"📄")))
+                fdate = extract_date_from_filename(fname)
+                self._full_results.append((disp, page, snip, path, src_icon.get(src,"📄"), fdate))
 
-            self._render_results(self._full_results)
+            self._render_results(self._apply_current_sort(self._full_results))
             self.filter_var.set("")
             self._rcnt.config(text=f"{len(merged):,}건 검색됨")
             self._set_status(f"검색 완료 — {len(merged):,}건","ok")
@@ -1433,39 +1508,136 @@ class App(tk.Tk):
             messagebox.showerror("검색 실패",str(e))
 
     def _render_results(self, results):
-        """(disp_path, page, snip, real_path, src_icon) 리스트를 카드로 표시."""
+        """(disp_path, page, snip, real_path, src_icon, file_date) 리스트를 카드로 표시."""
         self.result_list.clear()
         self._result_map = {}
         for i, row in enumerate(results):
             disp_path, page, snip, real_path = row[0], row[1], row[2], row[3]
             src_icon = row[4] if len(row) > 4 else "📄"
+            fdate    = row[5] if len(row) > 5 else None
             def make_open(p=real_path, pg=page):
                 try: open_pdf_at_page(p, pg, self.settings)
                 except Exception as e: messagebox.showerror("열기 실패", str(e))
-            self.result_list.add_card(i, disp_path, page, snip, src_icon, make_open)
+            self.result_list.add_card(i, disp_path, page, snip, src_icon, make_open, fdate=fdate)
+
+    # ── 정렬 ──────────────────────────────────
+    def _apply_current_sort(self, results):
+        return self._sort_results(results, self._sort_mode)
+
+    def _sort_results(self, results, mode):
+        CORONA = date(2020, 3, 1)
+        corona_on = getattr(self, "corona_var", None) and self.corona_var.get()
+
+        def is_post_corona(r):
+            fd = r[5] if len(r) > 5 else None
+            return bool(fd and fd >= CORONA)
+
+        def date_key(r):
+            fd = r[5] if len(r) > 5 else None
+            return (fd is None, fd if fd else date.min)
+
+        if mode == "newest":
+            if corona_on:
+                after  = sorted([r for r in results if     is_post_corona(r)], key=date_key, reverse=True)
+                before = sorted([r for r in results if not is_post_corona(r)], key=date_key, reverse=True)
+                return after + before
+            return sorted(results, key=date_key, reverse=True)
+
+        elif mode == "oldest":
+            if corona_on:
+                after  = sorted([r for r in results if     is_post_corona(r)], key=date_key)
+                before = sorted([r for r in results if not is_post_corona(r)], key=date_key)
+                return after + before
+            return sorted(results, key=date_key)
+
+        # relevance
+        if corona_on:
+            after  = [r for r in results if     is_post_corona(r)]
+            before = [r for r in results if not is_post_corona(r)]
+            return after + before
+        return list(results)
+
+
+    def _apply_sort(self, mode):
+        self._sort_mode = mode
+        if not self._full_results: return
+        base     = self._get_date_filtered()
+        sorted_r = self._sort_results(base, mode)
+        self._render_results(sorted_r)
+        self._rcnt.config(text=f"{len(sorted_r):,}건")
+        label = {"relevance":"관련도순","newest":"최신순","oldest":"오래된순"}.get(mode, mode)
+        self._set_status(f"{label}으로 정렬됨", "ok")
+
+    # ── 날짜 필터 ──────────────────────────────
+    def _parse_date_input(self, s):
+        s = s.strip()
+        if not s: return None
+        for pat in [r'(\d{4})[.\-_](\d{1,2})[.\-_](\d{1,2})', r'(\d{4})(\d{2})(\d{2})']:
+            m = re.fullmatch(pat, s)
+            if m:
+                try: return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError: pass
+        return None
+
+    def _get_date_filtered(self):
+        d_from = self._parse_date_input(self._date_from_var.get())
+        d_to   = self._parse_date_input(self._date_to_var.get())
+        if not d_from and not d_to:
+            return self._full_results
+        result = []
+        for r in self._full_results:
+            fd = r[5] if len(r) > 5 else None
+            if fd is None: continue
+            if d_from and fd < d_from: continue
+            if d_to   and fd > d_to:   continue
+            result.append(r)
+        return result
+
+    def on_apply_date_filter(self):
+        if not self._full_results:
+            self._set_status("먼저 검색을 실행하세요.", "idle"); return
+        if self._date_from_var.get().strip() and not self._parse_date_input(self._date_from_var.get()):
+            messagebox.showwarning("날짜 오류", "시작 날짜 형식이 잘못됐습니다.\n예) 2021.09.21"); return
+        if self._date_to_var.get().strip() and not self._parse_date_input(self._date_to_var.get()):
+            messagebox.showwarning("날짜 오류", "종료 날짜 형식이 잘못됐습니다.\n예) 2023.12.31"); return
+        filtered = self._get_date_filtered()
+        sorted_r = self._sort_results(filtered, self._sort_mode)
+        self._render_results(sorted_r)
+        self._rcnt.config(text=f"{len(sorted_r):,} / {len(self._full_results):,}건")
+        d_from = self._parse_date_input(self._date_from_var.get())
+        d_to   = self._parse_date_input(self._date_to_var.get())
+        rng = f"{d_from or '?'} ~ {d_to or '?'}"
+        self._set_status(f"날짜 필터 — {rng}  {len(sorted_r):,}건", "ok")
+
+    def on_reset_date_filter(self):
+        self._date_from_var.set(""); self._date_to_var.set("")
+        if not self._full_results: return
+        sorted_r = self._sort_results(self._full_results, self._sort_mode)
+        self._render_results(sorted_r)
+        self._rcnt.config(text=f"{len(self._full_results):,}건 (전체)")
+        self._set_status("날짜 필터 초기화됨", "ok")
 
     def on_filter_results(self):
-        """현재 검색 결과(_full_results) 안에서 키워드로 재필터링. 횟수 제한 없음."""
+        """결과 내 재검색 (날짜 필터 + 정렬 상태 유지)"""
         kw = self.filter_var.get().strip().lower()
-        if not hasattr(self, '_full_results') or not self._full_results:
+        if not self._full_results:
             self._set_status("먼저 검색을 실행하세요.", "idle"); return
-        if not kw:
-            self._render_results(self._full_results)
-            self._rcnt.config(text=f"{len(self._full_results):,}건 (전체)")
-            return
-        filtered = [r for r in self._full_results
-                    if kw in r[0].lower() or kw in r[2].lower()]
-        self._render_results(filtered)
-        self._rcnt.config(text=f"{len(filtered):,} / {len(self._full_results):,}건")
-        self._set_status(f"재검색 완료 — '{kw}'  {len(filtered):,}건", "ok")
+        base = self._get_date_filtered()
+        if kw:
+            base = [r for r in base if kw in r[0].lower() or kw in r[2].lower()]
+        sorted_r = self._sort_results(base, self._sort_mode)
+        self._render_results(sorted_r)
+        self._rcnt.config(text=f"{len(sorted_r):,} / {len(self._full_results):,}건")
+        self._set_status(f"재검색 — '{kw}'  {len(sorted_r):,}건", "ok")
 
     def on_reset_filter(self):
-        """재검색 초기화 — 원래 전체 결과로 복원."""
-        self.filter_var.set("")
-        if not hasattr(self, '_full_results') or not self._full_results: return
-        self._render_results(self._full_results)
+        """재검색 + 날짜 필터 모두 초기화"""
+        self.filter_var.set(""); self._date_from_var.set(""); self._date_to_var.set("")
+        if not self._full_results: return
+        sorted_r = self._sort_results(self._full_results, self._sort_mode)
+        self._render_results(sorted_r)
         self._rcnt.config(text=f"{len(self._full_results):,}건 (전체)")
-        self._set_status(f"검색 결과 초기화됨 — {len(self._full_results):,}건", "ok")
+        self._set_status(f"필터 초기화 — {len(self._full_results):,}건", "ok")
 
     def on_open_selected(self, _evt=None):
         pass  # 카드 더블클릭으로 직접 열림
